@@ -1,0 +1,68 @@
+{
+  "name": "pth-viewer",
+  "displayName": "PyTorch Structure Viewer",
+  "description": "Visualize the hierarchical structure (Tensors, Dictionaries) of PyTorch .pth and .pt files.",
+  "version": "0.0.1",
+  "publisher": "YourPublisherID", 
+  "engines": {
+    "vscode": "^1.106.1"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCustomEditor:pth-viewer.pthEditor",
+    "onCommand:pth-viewer.showPthStructure"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "pth-viewer.showPthStructure",
+        "title": "View PTH Structure"
+      }
+    ],
+    "customEditors": [
+      {
+        "viewType": "pth-viewer.pthEditor",
+        "displayName": "PyTorch Structure Viewer",
+        "selector": [
+          {
+            "filenamePattern": "*.pth"
+          },
+          {
+            "filenamePattern": "*.pt"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "pth-viewer.showPthStructure",
+          "when": "resourceExtname == '.pth' || resourceExtname == '.pt'",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.106.1",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "22.x",
+    "typescript-eslint": "^8.46.3",
+    "eslint": "^9.39.1",
+    "typescript": "^5.9.3",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2"
+  }
+}
