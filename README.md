@@ -30,6 +30,6 @@ PyTorch 库: 你的 Python 环境中必须安装了 torch 库 (pip install torch
 
 如果缺少这些依赖，插件将无法调用 Python 脚本来解析文件，并会在视图中显示错误信息。
 
-🔨 开发与贡献 (Development & Contribution)
+## 🔨 开发与贡献 (Development & Contribution)
 
 如果你想参与贡献或修改此插件，请访问我们的 GitHub 仓库

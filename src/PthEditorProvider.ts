@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as cp from 'child_process';
 import * as path from 'path';
+import { getPythonInterpreterPath } from './pythonApi';
 
 /**
  * 定义一个简单的文档类，用于持有文件的 Uri
@@ -47,23 +48,41 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
         token: vscode.CancellationToken
     ): Promise<void> {
         
-        // 1. 设置 Webview 的基本配置
+        // Webview 
         webviewPanel.webview.options = {
             enableScripts: true,
         };
+        webviewPanel.webview.html = getWebviewContent("正在加载 PyTorch 数据结构...<br>请确保你选择了正确的 Python 环境 (需包含 torch 库)。", webviewPanel.webview);
         
-        // 2. 初始加载视图
-        webviewPanel.webview.html = getWebviewContent("正在加载 PyTorch 数据结构...", webviewPanel.webview);
-
+        // file path
         const filePath = document.uri.fsPath; // 从我们自定义的 document 中获取路径
-
-        // 3. 调用 Python 脚本
         const scriptPath = path.join(this.context.extensionPath, 'python_scripts', 'reader.py');
         
-        cp.exec(`F:/Python/intepreter/anaconda3/python.exe "${scriptPath}" "${filePath}"`, (err, stdout, stderr) => {
+        // python 
+        // 动态获取当前选中的 Python 解释器路径
+        // 传入当前文档的 uri，以处理多工作区的情况
+        let pythonExecutable = await getPythonInterpreterPath(document.uri);
+        
+        // 为了处理路径中可能存在的空格（特别是在 Windows 上），给路径加上双引号
+        // 如果已经是 'python' 系统命令则不需要加，这里做个简单判断
+        if (pythonExecutable !== 'python') {
+            pythonExecutable = `"${pythonExecutable}"`;
+        }
+
+        // 构建最终执行命令
+        const command = `${pythonExecutable} "${scriptPath}" "${filePath}"`;
+        console.log("Executing command:", command);
+
+        cp.exec(command, (err, stdout, stderr) => {
             if (err) {
+                // ... 错误处理代码 ...
+                // 可以在这里提示用户检查 Python 环境
                 webviewPanel.webview.html = getWebviewContent(
-                    `<h3>Python 错误:</h3><p>请确保 Python 和 PyTorch 已安装并配置在环境变量中。</p><pre>${err.message}</pre>`, 
+                    `<h3>Python 运行错误:</h3>
+                     <p>请检查 VS Code 右下角选择的 Python 环境是否已安装 PyTorch。</p>
+                     <p>当前尝试使用的 Python 路径: <code>${pythonExecutable}</code></p>
+                     <pre>${err.message}</pre>
+                     <h4>Stderr:</h4><pre>${stderr}</pre>`, 
                     webviewPanel.webview
                 );
                 return;

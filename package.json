@@ -2,13 +2,27 @@
   "name": "pth-viewer",
   "displayName": "PyTorch Structure Viewer",
   "description": "Visualize the hierarchical structure (Tensors, Dictionaries) of PyTorch .pth and .pt files.",
-  "version": "0.0.1",
-  "publisher": "YourPublisherID", 
+  "version": "0.0.2",
+  "icon": "assets/icon_pth_viewer.png", 
+  "publisher": "pth-viewer",
+  
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yueduduo/pth-viewer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yueduduo/pth-viewer/issues"
+  },
+  "homepage": "https://github.com/yueduduo/pth-viewer/blob/main/README.md",
+
   "engines": {
     "vscode": "^1.106.1"
   },
   "categories": [
     "Other"
+  ],
+  "extensionDependencies": [
+    "ms-python.python"
   ],
   "activationEvents": [
     "onCustomEditor:pth-viewer.pthEditor",
