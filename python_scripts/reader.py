@@ -16,14 +16,21 @@ except ImportError:
 # 0. 通用辅助函数
 # ==========================================
 
+
+#  辅助函数：将扁平的 Key 路径插入到嵌套字典中
+#  输入: parts=['model', 'layer', '0', 'weight'], info={...}
+#  效果: tree['model']['layer']['0']['weight'] = info
 def insert_into_tree(tree, parts, info):
     """递归构建树状结构"""
     key = parts[0]
     if len(parts) == 1:
+        # 到达叶子节点
         tree[key] = info
     else:
+        # 如果当前层级不存在，或者是个叶子节点（冲突了），初始化为字典
         if key not in tree or not isinstance(tree[key], dict):
             tree[key] = {}
+        # 递归下一层
         insert_into_tree(tree[key], parts[1:], info)
 
 def format_tensor_stats(tensor_obj):
