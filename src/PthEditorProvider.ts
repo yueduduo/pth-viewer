@@ -52,10 +52,28 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
         webviewPanel.webview.options = {
             enableScripts: true,
         };
-        webviewPanel.webview.html = getWebviewContent("正在加载 PyTorch 数据结构...<br>请确保你选择了正确的 Python 环境 (需包含 torch 库)。", webviewPanel.webview);
+
+        // 监听 Webview 发来的消息 (用于切换模式)
+        webviewPanel.webview.onDidReceiveMessage(message => {
+            if (message.command === 'switchMode') {
+                const forceLocal = message.value; // true = 强制局部, false = 自动全局
+                this.loadPthContent(document, document.uri.fsPath, webviewPanel, forceLocal);
+            }
+        });
+        // 初始加载 (默认尝试全局)
+        this.loadPthContent(document, document.uri.fsPath, webviewPanel, false);
+    }
+    // 抽离加载逻辑，方便刷新
+    private async loadPthContent(document: PthDocument, filePath: string, panel: vscode.WebviewPanel, forceLocal: boolean) {
+        panel.webview.html = getWebviewContent(`
+            <div class="loading">
+                <div class="spinner"></div>
+                <p>正在解析模型结构... ${forceLocal ? '(单文件模式)' : '(自动检测索引)'}</p>
+                请确保你选择了正确的 Python 环境 (需包含 torch/safetensors 库)。
+            </div>
+        `, panel.webview);
         
-        // file path
-        const filePath = document.uri.fsPath; // 从我们自定义的 document 中获取路径
+
         const scriptPath = path.join(this.context.extensionPath, 'python_scripts', 'reader.py');
         
         // python 
@@ -70,20 +88,22 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
         }
 
         // 构建最终执行命令
-        const command = `${pythonExecutable} "${scriptPath}" "${filePath}"`;
+        // 根据模式添加参数
+        const args = forceLocal ? ' --force-local' : '';
+        const command = `${pythonExecutable} "${scriptPath}" "${filePath}"${args}`;
         console.log("Executing command:", command);
 
-        cp.exec(command, (err, stdout, stderr) => {
+        cp.exec(command, { maxBuffer: 1024 * 1024 * 50 }, (err, stdout, stderr) => {
             if (err) {
                 // ... 错误处理代码 ...
                 // 可以在这里提示用户检查 Python 环境
-                webviewPanel.webview.html = getWebviewContent(
+                panel.webview.html = getWebviewContent(
                     `<h3>Python 运行错误:</h3>
                      <p>请检查 VS Code 右下角选择的 Python 环境是否已安装 PyTorch。</p>
                      <p>当前尝试使用的 Python 路径: <code>${pythonExecutable}</code></p>
                      <pre>${err.message}</pre>
                      <h4>Stderr:</h4><pre>${stderr}</pre>`, 
-                    webviewPanel.webview
+                    panel.webview
                 );
                 return;
             }
@@ -93,19 +113,19 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
                 const data = JSON.parse(stdout);
                 
                 if (data.error) {
-                    webviewPanel.webview.html = getWebviewContent(
+                    panel.webview.html = getWebviewContent(
                         `<h3>数据读取错误:</h3><pre>${data.error}</pre>`, 
-                        webviewPanel.webview
+                        panel.webview
                     );
                 } else {
                     // 5. 生成 HTML 树状图并显示
-                    const htmlTree = generateJsonHtml(data);
-                    webviewPanel.webview.html = getWebviewContent(htmlTree, webviewPanel.webview);
+                    const htmlTree = generatePageHtml(data, forceLocal);
+                    panel.webview.html = getWebviewContent(htmlTree, panel.webview);
                 }
             } catch (e: any) {
-                webviewPanel.webview.html = getWebviewContent(
+                panel.webview.html = getWebviewContent(
                     `<h3>JSON 解析失败 (Python 输出非标准JSON):</h3><pre>${stdout}</pre>`,
-                    webviewPanel.webview
+                    panel.webview
                 );
             }
         });
@@ -113,9 +133,49 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
 }
 
 
+
+
 // ----------------------------------------------------
 //  辅助函数 (保持不变)
 // ----------------------------------------------------
+
+function generatePageHtml(result: any, isForceLocal: boolean): string {
+    const isGlobal = result.is_global;
+    const data = result.data;
+    const indexFile = result.index_file || "";
+
+    // 控制栏 HTML
+    let controlBar = '';
+    
+    if (isGlobal) {
+        controlBar = `
+            <div class="status-bar global-mode">
+                <span class="icon">🌐</span> 
+                <span><strong>全局视图:</strong> 已加载索引 <code>${indexFile}</code></span>
+                <button onclick="vscode.postMessage({command: 'switchMode', value: true})">切换为只看当前文件</button>
+            </div>
+        `;
+    } else if (isForceLocal) {
+        controlBar = `
+            <div class="status-bar local-mode">
+                <span class="icon">📄</span> 
+                <span><strong>单文件视图:</strong> 仅显示当前文件内容</span>
+                <button onclick="vscode.postMessage({command: 'switchMode', value: false})">尝试检测全局索引</button>
+            </div>
+        `;
+    } else {
+        controlBar = `
+            <div class="status-bar local-mode">
+                <span class="icon">📄</span> 
+                <span>单文件视图 (未检测到索引)</span>
+            </div>
+        `;
+    }
+
+    const treeHtml = generateJsonHtml(data);
+    return controlBar + treeHtml;
+}
+
 
 export function getWebviewContent(bodyContent: string, webview?: vscode.Webview): string {
     return `<!DOCTYPE html>
@@ -123,6 +183,9 @@ export function getWebviewContent(bodyContent: string, webview?: vscode.Webview)
     <head>
         <meta charset="UTF-8">
         <style>
+            :root {
+                    --vscode-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                }
             /* 1. 全局样式：使用 VS Code 字体和基础颜色 */
             body { 
                 font-family: var(--vscode-editor-font-family); /* 使用编辑器字体 */
@@ -131,6 +194,31 @@ export function getWebviewContent(bodyContent: string, webview?: vscode.Webview)
                 color: var(--vscode-foreground); /* 前景文字颜色 */
                 padding: 15px; 
             }
+
+            /* 状态栏样式 */
+            .status-bar {
+                padding: 8px 12px;
+                margin-bottom: 15px;
+                border-radius: 4px;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                font-size: 0.9em;
+                border: 1px solid var(--vscode-widget-border);
+            }
+            .global-mode { background-color: var(--vscode-notebook-cellInsertedBackground); border-left: 4px solid var(--vscode-notebook-statusSuccessIcon-foreground); }
+            .local-mode { background-color: var(--vscode-notebook-cellDeletedBackground); border-left: 4px solid var(--vscode-notebook-statusErrorIcon-foreground); }
+            
+            button {
+                margin-left: auto;
+                background: var(--vscode-button-background);
+                color: var(--vscode-button-foreground);
+                border: none;
+                padding: 4px 8px;
+                border-radius: 2px;
+                cursor: pointer;
+            }
+            button:hover { background: var(--vscode-button-hoverBackground); }
 
             /* 2. 标题样式 */
             h2 {
@@ -208,6 +296,10 @@ export function getWebviewContent(bodyContent: string, webview?: vscode.Webview)
                 border-radius: 4px;
             }
         </style>
+        <script>
+            <!-- 实现点击按钮, 有vscode事件触发 -->
+            const vscode = acquireVsCodeApi();
+        </script>
     </head>
     <body>
         <h2>PyTorch Structure Viewer</h2>
@@ -217,21 +309,30 @@ export function getWebviewContent(bodyContent: string, webview?: vscode.Webview)
 }
 
 export function generateJsonHtml(data: any): string {
-    if (data && data._type === 'tensor') {
-        const dtype = data.dtype || 'unknown';
-        const shape = data.shape ? data.shape.join(' × ') : 'scalar';
-        return `<span class="tensor-info">Tensor [ ${shape} ] (${dtype})</span>`;
+    // 递归生成 HTML (增加 location 显示)
+    if (data && (data._type === 'tensor' || data._type === 'tensor_ref')) {
+        const dtype = data.dtype || '?';
+        const shape = data.shape ? `[ ${data.shape.join('×')} ]` : '';
+        const loc = data.location ? `<span class="location-tag">${data.location}</span>` : '';
+        
+        let infoClass = "tensor-info";
+        if (data._type === 'tensor_ref') infoClass += " ref"; // 可以给引用类型单独加样式
+
+        // 如果是 tensor_ref (索引模式)，可能没有 shape/dtype
+        const detailStr = data._type === 'tensor' ? `${shape} (${dtype})` : `(索引引用)`;
+        
+        return `<span class="${infoClass}">${detailStr}</span>${loc}`;
     } else if (Array.isArray(data)) {
+        // ... 列表逻辑 (同前) ...
         let html = '<details open><summary>List []</summary><ul>';
-        data.forEach((item, index) => {
-            html += `<li><span class="key-name">[${index}]: </span>${generateJsonHtml(item)}</li>`;
-        });
+        data.forEach((item, index) => { html += `<li><span class="key-name">[${index}]: </span>${generateJsonHtml(item)}</li>`; });
         html += '</ul></details>';
         return html;
     } else if (typeof data === 'object' && data !== null) {
+        // ... 字典逻辑 (同前) ...
         let html = '<details open><summary>Dict {}</summary><ul>';
         for (const key in data) {
-            if (key === '_type') continue;
+            if (key === '_type' || key === 'dtype' || key === 'shape' || key === 'location') continue;
             html += `<li><span class="key-name">"${key}": </span>${generateJsonHtml(data[key])}</li>`;
         }
         html += '</ul></details>';

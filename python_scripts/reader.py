@@ -2,8 +2,9 @@ import torch
 import sys
 import json
 import os
+import argparse
 
-# 尝试导入 safetensors，如果用户没装，稍后会提示
+# 尝试导入 safetensors
 try:
     from safetensors import safe_open
     HAS_SAFETENSORS = True
@@ -27,86 +28,142 @@ def insert_into_tree(tree, parts, info):
         # 递归下一层
         insert_into_tree(tree[key], parts[1:], info)
 
-# -------------------------------------------------
-#  核心逻辑：处理常规对象 (torch.load 的结果)
-# -------------------------------------------------
-def summarize_data(data):
+# === 1. 读取单个 Safetensors 文件的 Header ===
+def read_local_safetensors(file_path):
+    if not HAS_SAFETENSORS:
+        return {"error": "缺少 safetensors 库，请运行 pip install safetensors"}
+    
+    tree = {}
+    try:
+        with safe_open(file_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                slice_info = f.get_slice(key)
+                info = {
+                    "_type": "tensor",
+                    "dtype": str(slice_info.get_dtype()),
+                    "shape": list(slice_info.get_shape()),
+                    "location": "Current File" # 标记来源
+                }
+                insert_into_tree(tree, key.split('.'), info)
+    except Exception as e:
+        return {"error": str(e)}
+    return tree
+
+# === 2. 读取单个 PyTorch 文件的内容 ===
+def read_local_torch(file_path):
+    try:
+        data = torch.load(file_path, map_location='cpu')
+        return summarize_torch_data(data)
+    except Exception as e:
+        return {"error": str(e)}
+
+def summarize_torch_data(data):
     if isinstance(data, dict):
-        return {k: summarize_data(v) for k, v in data.items()}
+        # 处理 State Dict 这种扁平结构，尝试构建树
+        # 这是一个简单的 heuristic：如果 key 包含 "."，我们尝试把它变成树
+        is_flat_state_dict = all(isinstance(k, str) for k in data.keys())
+        if is_flat_state_dict and any("." in k for k in data.keys()):
+            tree = {}
+            for k, v in data.items():
+                info = summarize_torch_data(v)
+                insert_into_tree(tree, k.split('.'), info)
+            return tree
+        else:
+            return {k: summarize_data_recursive(v) for k, v in data.items()}
+    return summarize_data_recursive(data)
+
+def summarize_data_recursive(data):
+    if isinstance(data, dict):
+        return {k: summarize_data_recursive(v) for k, v in data.items()}
     elif isinstance(data, (list, tuple)):
-        return [summarize_data(v) for v in data]
+        return [summarize_data_recursive(v) for v in data]
     elif torch.is_tensor(data):
         return {
             "_type": "tensor",
             "dtype": str(data.dtype).split('.')[-1],
-            "shape": list(data.shape)
+            "shape": list(data.shape),
+            "location": "Current File"
         }
-    elif isinstance(data, (int, float, str, bool, type(None))):
-        return data
     else:
         return str(type(data))
 
-# -------------------------------------------------
-#  核心逻辑：处理 Safetensors 文件
-# -------------------------------------------------
-def read_safetensors_file(file_path):
-    if not HAS_SAFETENSORS:
-        return {"error": "缺少依赖: 请在当前 Python 环境中安装 safetensors 库。\n运行: pip install safetensors"}
-    
-    tree_structure = {}
-    
+# === 3. 读取 Index JSON 构建全局视图 ===
+def read_global_index(index_path, current_file_name):
     try:
-        # framework="pt" 表示 PyTorch，device="cpu" 确保不占显存
-        with safe_open(file_path, framework="pt", device="cpu") as f:
-            keys = f.keys() # 获取所有扁平的键，如 "model.layers.0.weight"
-            
-            for key in keys:
-                # 获取元数据 (不加载 Tensor 数据，速度极快)
-                tensor_slice = f.get_slice(key)
-                shape = tensor_slice.get_shape()
-                dtype = str(tensor_slice.get_dtype()) # e.g. 'float32'
-                
-                # 构造符合前端标准的信息对象
-                info = {
-                    "_type": "tensor",
-                    "dtype": dtype,
-                    "shape": list(shape)
-                }
-                
-                # 将扁平 Key 拆解并构建树
-                # 假设分隔符是 "."
-                parts = key.split('.')
-                insert_into_tree(tree_structure, parts, info)
-                
-    except Exception as e:
-        return {"error": f"读取 safetensors 文件失败: {str(e)}"}
+        with open(index_path, 'r', encoding='utf-8') as f:
+            index_data = json.load(f)
         
-    return tree_structure
+        weight_map = index_data.get("weight_map", {})
+        tree = {}
+        
+        for key, filename in weight_map.items():
+            # 标记这个参数是在当前文件，还是在其他分片
+            loc_str = "Current File" if filename == current_file_name else f"File: {filename}"
+            
+            info = {
+                "_type": "tensor_ref", # 这是一个引用，可能读不到 shape
+                "location": loc_str
+            }
+            insert_into_tree(tree, key.split('.'), info)
+            
+        return {
+            "is_global": True,
+            "index_file": os.path.basename(index_path),
+            "data": tree
+        }
+    except Exception as e:
+        return {"error": f"Index read failed: {str(e)}"}
 
+# === 主逻辑 ===
 if __name__ == "__main__":
-    # 配置标准输出为 UTF-8 且无缓冲
     sys.stdout = open(sys.stdout.fileno(), mode='w', encoding='utf8', buffering=1)
     
-    if len(sys.argv) < 2:
-        print(json.dumps({"error": "No file path provided."}))
-        sys.exit(1)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("file_path", help="Path to the model file")
+    parser.add_argument("--force-local", action="store_true", help="Force read only local file")
+    args = parser.parse_args()
 
-    file_path = sys.argv[1]
+    file_path = args.file_path
+    force_local = args.force_local
     
-    try:
-        if file_path.endswith('.safetensors'):
-            # === 处理 Safetensors ===
-            summary = read_safetensors_file(file_path)
+    dir_name = os.path.dirname(file_path)
+    base_name = os.path.basename(file_path)
+    
+    # 定义可能的索引文件名
+    # 1. model.safetensors.index.json (Huggingface 通用)
+    # 2. pytorch_model.bin.index.json
+    # 3. [filename].index.json
+    possible_indexes = [
+        "model.safetensors.index.json",
+        "pytorch_model.bin.index.json",
+        base_name + ".index.json"
+    ]
+    
+    found_index = None
+    if not force_local:
+        for idx in possible_indexes:
+            idx_path = os.path.join(dir_name, idx)
+            if os.path.exists(idx_path):
+                found_index = idx_path
+                break
+    
+    result = {}
+    
+    if found_index:
+        # --> 进入全局模式
+        result = read_global_index(found_index, base_name)
+    else:
+        # --> 进入局部模式 (Fallback)
+        is_safetensors = file_path.endswith('.safetensors')
+        data = None
+        if is_safetensors:
+            data = read_local_safetensors(file_path)
         else:
-            # === 处理 PTH / PT ===
-            # 使用 map_location='cpu' 避免 GPU 错误
-            content = torch.load(file_path, map_location='cpu')
-            summary = summarize_data(content)
-        
-        # 输出 JSON
-        print(json.dumps(summary, ensure_ascii=False, separators=(',', ':')))
-        
-    except Exception as e:
-        # 顶层错误捕获
-        error_msg = {"error": f"Failed to load file. Detail: {str(e)}"}
-        print(json.dumps(error_msg, ensure_ascii=False))
+            data = read_local_torch(file_path)
+            
+        result = {
+            "is_global": False,
+            "data": data
+        }
+
+    print(json.dumps(result, ensure_ascii=False, separators=(',', ':')))

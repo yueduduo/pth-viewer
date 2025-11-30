@@ -49,6 +49,9 @@
           },
           {
             "filenamePattern": "*.safetensors" 
+          },
+          {
+            "filenamePattern": "*.bin"
           }
         ],
         "priority": "default"
@@ -58,7 +61,7 @@
       "explorer/context": [
         {
           "command": "pth-viewer.showPthStructure",
-          "when": "resourceExtname == '.pth' || resourceExtname == '.pt' || resourceExtname == '.safetensors'",
+          "when": "resourceExtname == '.pth' || resourceExtname == '.pt' || resourceExtname == '.safetensors' || resourceExtname == '.bin'",
           "group": "navigation"
         }
       ]
