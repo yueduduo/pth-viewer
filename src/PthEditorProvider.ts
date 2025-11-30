@@ -59,6 +59,12 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
                 const forceLocal = message.value; // true = 强制局部, false = 自动全局
                 this.loadPthContent(document, document.uri.fsPath, webviewPanel, forceLocal);
             }
+            // === 处理查看数据请求 ===
+            if (message.command === 'inspect') {
+                const key = message.key;
+                const elementId = message.id;
+                this.inspectTensorData(document.uri.fsPath, key, elementId, webviewPanel);
+            }
         });
         // 初始加载 (默认尝试全局)
         this.loadPthContent(document, document.uri.fsPath, webviewPanel, false);
@@ -127,6 +133,39 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
                     `<h3>JSON 解析失败 (Python 输出非标准JSON):</h3><pre>${stdout}</pre>`,
                     panel.webview
                 );
+            }
+        });
+    }
+
+    // 新增：专门用于获取 Tensor 数据的函数
+    private async inspectTensorData(filePath: string, key: string, elementId: string, panel: vscode.WebviewPanel) {
+        const scriptPath = path.join(this.context.extensionPath, 'python_scripts', 'reader.py');
+        let pythonExecutable = await getPythonInterpreterPath(undefined);
+        if (pythonExecutable !== 'python') pythonExecutable = `"${pythonExecutable}"`;
+
+        // 注意：message.key 已经是 JSON 字符串了 '["policy", "net.0.weight"]'
+        // 我们需要把这个字符串安全地放在命令行参数里。
+        // 在 Windows Powershell/CMD 中，内部的双引号需要转义，或者外层用单引号（视情况而定）。
+        // 最简单的方法：把 JSON 里的双引号转义一下，或者直接依靠 cp.exec 的自动处理(如果有的话，但通常没有)。
+        
+        // 简单粗暴但有效的转义：把双引号变成转义的双引号
+        const escapedKey = key.replace(/"/g, '\\"'); 
+        
+        // 最终命令类似于: python reader.py file.pth --action data --key "[\"policy\", \"net.0.weight\"]"
+        const command = `${pythonExecutable} "${scriptPath}" "${filePath}" --action data --key "${escapedKey}"`;
+        
+        cp.exec(command, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
+            if (err) {
+                // 发消息回 Webview 显示错误
+                panel.webview.postMessage({ command: 'showData', id: elementId, error: err.message });
+                return;
+            }
+            try {
+                const result = JSON.parse(stdout);
+                // 发消息回 Webview 显示数据
+                panel.webview.postMessage({ command: 'showData', id: elementId, data: result });
+            } catch (e: any) {
+                panel.webview.postMessage({ command: 'showData', id: elementId, error: "Parse Error" });
             }
         });
     }
@@ -295,10 +334,84 @@ export function getWebviewContent(bodyContent: string, webview?: vscode.Webview)
                 padding: 10px;
                 border-radius: 4px;
             }
+
+            /* inspect 查看数据 新增样式 */
+            .inspect-btn {
+                cursor: pointer;
+                border: 1px solid var(--vscode-button-border);
+                border-radius: 3px;
+                padding: 0 4px;
+                margin-left: 5px;
+                font-size: 0.8em;
+            }
+            .inspect-btn:hover {
+                background-color: var(--vscode-button-secondaryHoverBackground);
+            }
+            .data-preview {
+                margin-top: 5px;
+                padding: 8px;
+                background-color: var(--vscode-editor-inactiveSelectionBackground);
+                border-left: 3px solid var(--vscode-charts-blue);
+                font-family: 'Consolas', monospace;
+                font-size: 0.85em;
+                white-space: pre; /* 保持 PyTorch 的多维缩进格式 */
+                overflow-x: auto;
+            }
+            .stats-row {
+                margin-bottom: 5px;
+                color: var(--vscode-descriptionForeground);
+                border-bottom: 1px dashed var(--vscode-editorRuler-foreground);
+                padding-bottom: 4px;
+            }
+            .stats-item { margin-right: 15px; }
         </style>
         <script>
             <!-- 实现点击按钮, 有vscode事件触发 -->
             const vscode = acquireVsCodeApi();
+
+            // === 新增：辅助函数，用于解码并发送消息 ===
+            function postInspectMessage(safePath, btnId) {
+                // 解码: %5B... -> ["policy", "net.0.weight"]
+                const jsonPath = decodeURIComponent(safePath);
+                vscode.postMessage({
+                    command: 'inspect',
+                    key: jsonPath, // 现在发给 extension 的是 JSON 字符串
+                    id: btnId
+                });
+            }
+
+            // 监听插件发回来的数据
+            window.addEventListener('message', event => {
+                const message = event.data;
+                if (message.command === 'showData') {
+                    const container = document.getElementById(message.id);
+                    if (!container) return;
+                    
+                    container.style.display = 'block';
+                    
+                    if (message.error) {
+                        container.innerHTML = '<span style="color:red">Error: ' + message.error + '</span>';
+                    } else if (message.data.error) {
+                        container.innerHTML = '<span style="color:red">Error: ' + message.data.error + '</span>';
+                    } else {
+                        const stats = message.data.stats;
+                        const preview = message.data.preview;
+                        
+                        // 渲染统计信息
+                        const statsHtml = \`
+                            <div class="stats-row">
+                                <span class="stats-item">Min: <strong>\${stats.min}</strong></span>
+                                <span class="stats-item">Max: <strong>\${stats.max}</strong></span>
+                                <span class="stats-item">Mean: <strong>\${stats.mean}</strong></span>
+                                <span class="stats-item">Std: <strong>\${stats.std}</strong></span>
+                            </div>
+                        \`;
+                        
+                        // 渲染多维数组内容
+                        container.innerHTML = statsHtml + preview;
+                    }
+                }
+            });
         </script>
     </head>
     <body>
@@ -308,35 +421,83 @@ export function getWebviewContent(bodyContent: string, webview?: vscode.Webview)
     </html>`;
 }
 
-export function generateJsonHtml(data: any): string {
-    // 递归生成 HTML (增加 location 显示)
-    if (data && (data._type === 'tensor' || data._type === 'tensor_ref')) {
+// 1. 修改参数类型：keyPath 改为 string[]，默认是空数组
+export function generateJsonHtml(data: any, keyPath: string[] = []): string {
+    // 原来是: if (!data) return '';  <-- 这是错的，因为 0 会被当成 false
+    if (data === null || data === undefined) return '';
+
+    const isTensor = data._type === 'tensor' || data._type === 'tensor_ref';
+    let tensorHtml = '';
+    
+    if (isTensor) {
         const dtype = data.dtype || '?';
-        const shape = data.shape ? `[ ${data.shape.join('×')} ]` : '';
+        
+        let shapeStr = '';
+        if (data.shape) {
+            if (data.shape.length === 0) {
+                // 如果长度为0，说明是标量 (Scalar)
+                shapeStr = '<span style="color:var(--vscode-textLink-foreground);">[Scalar]</span>';
+            } else {
+                // 否则显示维度
+                shapeStr = `[ ${data.shape.join('×')} ]`;
+            }
+        }
+        
         const loc = data.location ? `<span class="location-tag">${data.location}</span>` : '';
         
         let infoClass = "tensor-info";
-        if (data._type === 'tensor_ref') infoClass += " ref"; // 可以给引用类型单独加样式
+        if (data._type === 'tensor_ref') infoClass += " ref";
 
-        // 如果是 tensor_ref (索引模式)，可能没有 shape/dtype
-        const detailStr = data._type === 'tensor' ? `${shape} (${dtype})` : `(索引引用)`;
+        // === 核心修改：生成安全的路径 JSON ===
+        // 1. 转成 JSON 字符串: ["policy", "net.0.weight"]
+        const jsonPath = JSON.stringify(keyPath);
+        // 2. 编码，防止 HTML 属性里的引号冲突: %5B%22policy%22...
+        const safePath = encodeURIComponent(jsonPath);
+        // 3. 生成唯一 ID (CSS ID 不能有特殊字符，这里简单的替换一下即可，或者用 safePath 做 ID 的一部分)
+        const btnId = `btn-${safePath.replace(/[^a-zA-Z0-9]/g, '-')}`; 
+
+        const detailStr = data._type === 'tensor' ? `${shapeStr} (${dtype})` : `(索引引用)`;
         
-        return `<span class="${infoClass}">${detailStr}</span>${loc}`;
-    } else if (Array.isArray(data)) {
-        // ... 列表逻辑 (同前) ...
-        let html = '<details open><summary>List []</summary><ul>';
-        data.forEach((item, index) => { html += `<li><span class="key-name">[${index}]: </span>${generateJsonHtml(item)}</li>`; });
-        html += '</ul></details>';
-        return html;
+        // 注意：onclick 这里我们要传 safePath，后端拿到后再 decodeURIComponent
+        // 但其实 postMessage 可以直接传对象，我们这里为了简单，传 safePath 字符串
+        const inspectBtn = data._type === 'tensor' 
+            ? `<span class="inspect-btn" title="查看数值" onclick="postInspectMessage('${safePath}', '${btnId}')">🔍</span>` 
+            : '';
+
+        tensorHtml = `<span class="${infoClass}">${detailStr}</span>${loc} ${inspectBtn} <div id="${btnId}" class="data-preview" style="display:none;"></div>`;
+    }
+
+    let childrenHtml = '';
+    let hasChildren = false;
+
+    if (Array.isArray(data)) {
+        let listItems = '';
+        data.forEach((item, index) => {
+            // === 核心修改：路径追加 (Push) ===
+            // 创建新数组，避免污染父级 path
+            const currentPath = [...keyPath, index.toString()]; 
+            listItems += `<li><span class="key-name">[${index}]: </span>${generateJsonHtml(item, currentPath)}</li>`;
+        });
+        if (listItems) { childrenHtml = `<ul>${listItems}</ul>`; hasChildren = true; }
     } else if (typeof data === 'object' && data !== null) {
-        // ... 字典逻辑 (同前) ...
-        let html = '<details open><summary>Dict {}</summary><ul>';
+        let listItems = '';
         for (const key in data) {
-            if (key === '_type' || key === 'dtype' || key === 'shape' || key === 'location') continue;
-            html += `<li><span class="key-name">"${key}": </span>${generateJsonHtml(data[key])}</li>`;
+            if (['_type', 'dtype', 'shape', 'location'].includes(key)) continue;
+            // === 核心修改：路径追加 (Push) ===
+            const currentPath = [...keyPath, key];
+            listItems += `<li><span class="key-name">"${key}": </span>${generateJsonHtml(data[key], currentPath)}</li>`;
         }
-        html += '</ul></details>';
-        return html;
+        if (listItems) { childrenHtml = `<ul>${listItems}</ul>`; hasChildren = true; }
+    }
+
+    // ... (后面的 return 逻辑保持不变)
+    if (isTensor && hasChildren) {
+        return `<details open><summary>${tensorHtml}</summary>${childrenHtml}</details>`;
+    } else if (isTensor) {
+        return tensorHtml;
+    } else if (hasChildren) {
+        const summary = Array.isArray(data) ? 'List []' : 'Dict {}';
+        return `<details open><summary>${summary}</summary>${childrenHtml}</details>`;
     } else {
         return `<span>${data}</span>`;
     }
