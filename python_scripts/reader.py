@@ -5,12 +5,25 @@ import os
 import argparse
 import math
 
-# 尝试导入 safetensors
+# ==========================================
+# 依赖检测
+# ==========================================
+
+# Safetensors
 try:
     from safetensors import safe_open
     HAS_SAFETENSORS = True
 except ImportError:
     HAS_SAFETENSORS = False
+
+# JAX / Orbax
+try:
+    import jax
+    import orbax.checkpoint as ocp
+    import numpy as np
+    HAS_JAX = True
+except ImportError:
+    HAS_JAX = False
 
 # ==========================================
 # 0. 通用辅助函数
@@ -46,7 +59,51 @@ def format_tensor_stats(tensor_obj):
             return f
         except:
             return None
+    # JAX Array 兼容性处理
+    # 如果是 JAX array，先转成 numpy，再转成 torch tensor 以复用后续逻辑
+    # 或者直接提取属性（JAX 和 Torch 在 shape/dtype 上属性名基本一致）
+    is_jax = HAS_JAX and isinstance(tensor_obj, (jax.Array, np.ndarray))
+    
+    if is_jax:
+        # 转为 numpy 以便计算统计值
+        data_np = np.array(tensor_obj)
+        # 如果是 bfloat16，numpy 可能处理不好，这里简单处理
+        if data_np.size == 0:
+             return {
+                "type": "tensor_data",
+                "stats": {"min": None, "max": None, "mean": None, "std": None, "shape": list(data_np.shape), "dtype": str(data_np.dtype)},
+                "preview": "[]"
+            }
+        
+        try:
+             # 计算统计量
+            min_val = float(data_np.min())
+            max_val = float(data_np.max())
+            mean_val = float(data_np.mean())
+            std_val = float(data_np.std()) if data_np.size > 1 else None
+            
+            stats = {
+                "min": clean_float(min_val),
+                "max": clean_float(max_val),
+                "mean": clean_float(mean_val),
+                "std": clean_float(std_val),
+                "shape": list(data_np.shape),
+                "dtype": str(data_np.dtype)
+            }
+            # 预览字符串
+            preview_str = str(data_np)
+            # 限制长度
+            if len(preview_str) > 1000: preview_str = preview_str[:1000] + "..."
+            
+            return {
+                "type": "tensor_data",
+                "stats": stats,
+                "preview": preview_str
+            }
+        except Exception as e:
+             return {"error": f"JAX Stats Error: {str(e)}"}
 
+    # PyTorch 处理逻辑 (保持原样)
     # 1. 基础数据准备
     t_float = tensor_obj.to(dtype=torch.float32)
     
@@ -233,17 +290,149 @@ class SafetensorsReader(BaseReader):
              return {"error": f"Failed to retrieve tensor: {flat_key} ({str(e)})"}
 
 # ==========================================
+# 5. JAX / Orbax Reader (NEW!)
+# ==========================================
+
+class JaxReader(BaseReader):
+    def load(self):
+        if not HAS_JAX:
+            raise ImportError("JAX/Orbax not installed. Please run: pip install jax orbax-checkpoint")
+
+        # 逻辑：Orbax 加载的是目录。
+        # 如果用户选中的是 "checkpoint" 文件，我们取其所在的目录。
+        target_path = self.file_path
+        if os.path.isfile(target_path):
+            dir_path = os.path.dirname(target_path)
+            # 检查是否有 params 子目录（这是 convert_from_jax.py 的逻辑）
+            if os.path.exists(os.path.join(dir_path, "params")):
+                target_path = os.path.join(dir_path, "params")
+            else:
+                # 否则尝试直接加载该目录
+                target_path = dir_path
+        
+        # 强制使用 CPU，防止分配显存导致卡死
+        try:
+            devices = jax.devices("cpu")
+            sharding = jax.sharding.SingleDeviceSharding(devices[0])
+        except:
+            sharding = None
+
+        # 使用 Orbax 恢复 Checkpoint
+        # 参考了你提供的 load_jax_weights 逻辑
+        with ocp.PyTreeCheckpointer() as ckptr:
+            # 1. 读取元数据
+            metadata = ckptr.metadata(target_path)
+            
+            # 2. 构建 restore_args (强制 CPU)
+            restore_args = jax.tree.map(
+                lambda _: ocp.ArrayRestoreArgs(
+                    restore_type=jax.Array,
+                    sharding=sharding, 
+                ),
+                metadata,
+            )
+
+            # 3. 恢复数据
+            loaded = ckptr.restore(
+                target_path,
+                ocp.args.PyTreeRestore(
+                    item=metadata,
+                    restore_args=restore_args,
+                ),
+            )
+            
+            # Orbax 经常包一层 "params" key，或者 "value"
+            if "params" in loaded:
+                self.content = loaded["params"]
+            else:
+                self.content = loaded
+
+    def _recursive_summary(self, data):
+        # 递归处理 PyTree (Dict/List/Array)
+        if isinstance(data, dict):
+            # 处理 Orbax 可能存在的 {"value": Array} 包装
+            if "value" in data and len(data) == 1:
+                return self._recursive_summary(data["value"])
+            return {k: self._recursive_summary(v) for k, v in data.items()}
+        
+        elif isinstance(data, (list, tuple)):
+            return [self._recursive_summary(v) for v in data]
+        
+        elif HAS_JAX and isinstance(data, (jax.Array, np.ndarray)):
+            # JAX Array
+            return {
+                "_type": "tensor",
+                "dtype": str(data.dtype),
+                "shape": list(data.shape),
+                "location": "JAX Checkpoint"
+            }
+        elif isinstance(data, (int, float, str, bool, type(None))):
+            return data
+        else:
+            return str(type(data))
+
+    def get_structure(self):
+        try:
+            if self.content is None: self.load()
+            return self._recursive_summary(self.content)
+        except Exception as e:
+            return {"error": f"JAX Load Error: {str(e)}"}
+
+    def get_tensor_data(self, key_path_json):
+        try:
+            if self.content is None: self.load()
+            keys = json.loads(key_path_json)
+        except:
+            return {"error": "Invalid JSON key path"}
+
+        obj = self.content
+        try:
+            for k in keys:
+                # 自动解包 "value" 层（Orbax 特性）
+                if isinstance(obj, dict) and "value" in obj and k != "value" and k not in obj:
+                     obj = obj["value"]
+
+                if isinstance(obj, (list, tuple)):
+                    if isinstance(k, str) and k.isdigit():
+                        obj = obj[int(k)]
+                    else:
+                        obj = obj[k]
+                else:
+                    obj = obj[k]
+            
+            # 再次检查末尾是否包裹了 "value"
+            if isinstance(obj, dict) and "value" in obj and len(obj) == 1:
+                obj = obj["value"]
+                
+        except Exception as e:
+            return {"error": f"Key not found: {keys} ({str(e)})"}
+
+        return format_tensor_stats(obj)
+
+# ==========================================
 # 4. Reader Factory
 # ==========================================
 
 class ReaderFactory:
     @staticmethod
     def get_reader(file_path):
+        filename = os.path.basename(file_path)
+        
+        # 1. Safetensors
         if file_path.endswith('.safetensors'):
             return SafetensorsReader(file_path)
+        
+        # 2. JAX / Orbax
+        # 通常 JAX checkpoint 包含一个叫 "checkpoint" 的文件
+        # 或者文件名为 "commit_success" 等 Orbax 标记
+        # 我们允许用户点击 "checkpoint" 文件来加载
+        elif filename == "checkpoint" or filename == "commit_success" or "msgpack" in filename or ".ocdbt" in file_path:
+            return JaxReader(file_path)
+            
+        # 3. 默认为 PyTorch，涵盖 .pth, .pt, .bin
         else:
-            # 默认为 PyTorch，涵盖 .pth, .pt, .bin
             return TorchReader(file_path)
+
 
 # ==========================================
 # 5. Global Index Logic (Independent)
@@ -309,7 +498,8 @@ if __name__ == "__main__":
             ]
             
             found_index = None
-            if not args.force_local:
+            # JAX 通常没有这种全局索引文件，所以如果是 JaxReader 就不查索引了
+            if not args.force_local and not isinstance(reader, JaxReader):
                 for idx in possible_indexes:
                     idx_path = os.path.join(dir_name, idx)
                     if os.path.exists(idx_path):

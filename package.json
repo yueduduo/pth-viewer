@@ -52,6 +52,9 @@
           },
           {
             "filenamePattern": "*.bin"
+          },
+          {
+            "filenamePattern": "*.ocdbt"
           }
         ],
         "priority": "default"
@@ -61,7 +64,7 @@
       "explorer/context": [
         {
           "command": "pth-viewer.showPthStructure",
-          "when": "resourceExtname == '.pth' || resourceExtname == '.pt' || resourceExtname == '.safetensors' || resourceExtname == '.bin'",
+          "when": "resourceExtname == '.pth' || resourceExtname == '.pt' || resourceExtname == '.safetensors' || resourceExtname == '.bin' || resourceExtname == '.ocdbt'",
           "group": "navigation"
         }
       ]
