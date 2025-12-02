@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import * as cp from 'child_process';
 import * as path from 'path';
+import * as fs from 'fs';           // <--- for 缓存
+import * as crypto from 'crypto';   // <--- for 缓存
 import { getPythonInterpreterPath } from './pythonApi';
 
 /**
@@ -69,17 +71,105 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
         // 初始加载 (默认尝试全局)
         this.loadPthContent(document, document.uri.fsPath, webviewPanel, false);
     }
+
+    // ----------------------------------------------------------------------
+    // 新增：缓存相关的辅助方法
+    // ----------------------------------------------------------------------
+
+    /**
+     * 计算缓存文件的唯一哈希 (Cache Key)
+     * 规则: MD5(文件路径 + 修改时间 + 文件大小 + 是否强制单文件模式)
+     * 这样只要文件变了，或者查看模式变了，缓存自动失效
+     */
+    private computeCacheKey(filePath: string, forceLocal: boolean): string | null {
+        try {
+            const stats = fs.statSync(filePath);
+            const keyContent = `${filePath}-${stats.mtimeMs}-${stats.size}-${forceLocal}`;
+            return crypto.createHash('md5').update(keyContent).digest('hex');
+        } catch (e) {
+            return null; // 文件可能不存在
+        }
+    }
+
+    /**
+     * 获取缓存文件的完整路径
+     */
+    private getCachePath(hash: string): string {
+        const storagePath = this.context.globalStorageUri.fsPath;
+        const cacheDir = path.join(storagePath, 'cache');
+        // 确保存储目录存在
+        if (!fs.existsSync(cacheDir)) {
+            fs.mkdirSync(cacheDir, { recursive: true });
+        }
+        return path.join(cacheDir, `${hash}.json`);
+    }
+
+    /**
+     * 将解析结果写入缓存
+     */
+    private saveToCache(hash: string, filePath: string, resultData: any) {
+        try {
+            const cachePath = this.getCachePath(hash);
+            const stats = fs.statSync(filePath);
+            
+            // 构建缓存对象 (为未来扩展 Metadata 做准备)
+            const cacheContent = {
+                version: "1.0",
+                source_hash: hash,
+                timestamp: Date.now(),
+                meta: {
+                    file_path: filePath,
+                    file_size: stats.size,
+                    // TODO: 这里未来可以扩展 param_count, arch 等信息
+                },
+                data: resultData // Python 返回的原始结构
+            };
+
+            fs.writeFileSync(cachePath, JSON.stringify(cacheContent), 'utf-8');
+            console.log(`[Cache] Saved to: ${cachePath}`);
+        } catch (e) {
+            console.error("[Cache] Write failed:", e);
+        }
+    }
+
     // 抽离加载逻辑，方便刷新
     private async loadPthContent(document: PthDocument, filePath: string, panel: vscode.WebviewPanel, forceLocal: boolean) {
+        // 1. 显示加载动画
         panel.webview.html = getWebviewContent(`
             <div class="loading">
                 <div class="spinner"></div>
                 <p>正在解析模型结构... ${forceLocal ? '(单文件模式)' : '(自动检测索引)'}</p>
-                请确保你选择了正确的 Python 环境 (需包含 torch/safetensors 库)。
+                请确保你选择了正确的 Python 环境 (需包含 torch|safetensors|Jax&orbax 库)。
+                <p style="font-size:0.8em; color:var(--vscode-descriptionForeground);">大型文件首次加载需要较长时间，后续将使用缓存秒开。</p>
             </div>
         `, panel.webview);
         
+        // 2. === 尝试读取缓存 ===
+        const cacheHash = this.computeCacheKey(filePath, forceLocal);
+        if (cacheHash) {
+            const cacheFilePath = this.getCachePath(cacheHash);
+            if (fs.existsSync(cacheFilePath)) {
+                try {
+                    console.log(`[Cache] Hit! Loading from ${cacheFilePath}`);
+                    const cacheRaw = fs.readFileSync(cacheFilePath, 'utf-8');
+                    const cacheJson = JSON.parse(cacheRaw);
+                    
+                    // 渲染缓存的数据
+                    // 注意：cacheJson.data 才是我们要传给 generatePageHtml 的对象
+                    const htmlTree = generatePageHtml(cacheJson.data, forceLocal);
+                    
+                    // 可以在界面上加一个小标记提示是缓存内容 (可选)
+                    // 这里的 render 调用保持不变
+                    panel.webview.html = getWebviewContent(htmlTree, panel.webview);
+                    return; // 命中缓存，直接结束，不跑 Python
+                } catch (e) {
+                    console.warn("[Cache] Read failed, falling back to python:", e);
+                    // 如果缓存读取失败（比如损坏），继续往下走运行 Python
+                }
+            }
+        }
 
+        // 3. === 缓存未命中，运行 Python 解析 ===
         const scriptPath = path.join(this.context.extensionPath, 'python_scripts', 'reader.py');
         
         // python 
@@ -105,7 +195,7 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
                 // 可以在这里提示用户检查 Python 环境
                 panel.webview.html = getWebviewContent(
                     `<h3>Python 运行错误:</h3>
-                     <p>请检查 VS Code 右下角选择的 Python 环境是否已安装 PyTorch。</p>
+                     <p>请检查 VS Code 右下角选择的 Python 环境是否已安装 PyTorch|safetensors|Jax&orbax。</p>
                      <p>当前尝试使用的 Python 路径: <code>${pythonExecutable}</code></p>
                      <pre>${err.message}</pre>
                      <h4>Stderr:</h4><pre>${stderr}</pre>`, 
@@ -124,7 +214,12 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
                         panel.webview
                     );
                 } else {
-                    // 5. 生成 HTML 树状图并显示
+                    // 5. === 解析成功，写入缓存 ===
+                    if (cacheHash) {
+                        this.saveToCache(cacheHash, filePath, data);
+                    }
+
+                    // 6. 生成 HTML 树状图并显示
                     const htmlTree = generatePageHtml(data, forceLocal);
                     panel.webview.html = getWebviewContent(htmlTree, panel.webview);
                 }
