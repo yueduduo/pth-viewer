@@ -60,7 +60,7 @@
 ### 2. 环境配置
 插件依赖于你本地的 Python 环境。
 
-请首先在 VS Code 右下角的状态栏中，点击本插件图标 <img src="assets/status_icon.svg" height="16" style="vertical-align: middle;" /> ，选择包含相关依赖库（如 torch, safetensors 等）的 Python 解释器。
+请首先在 VS Code 右下角的状态栏中，点击本插件图标 <img src="assets/status_icon.png" height="16" style="vertical-align: middle;" /> ，选择包含相关依赖库（如 torch, safetensors 等）的 Python 解释器。
 
 ## ⚠️ 环境要求
 

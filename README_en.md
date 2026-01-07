@@ -59,7 +59,7 @@ There are two ways to view a target file:
 ### 2. Environment Setup
 The extension relies on your local Python environment. 
 
-Please click the extension icon <img src="assets/status_icon.svg" height="14" style="vertical-align: middle;" /> in the VS Code status bar (bottom right) to select a Python interpreter that includes the necessary libraries (e.g., torch, safetensors).
+Please click the extension icon <img src="assets/status_icon.png" height="14" style="vertical-align: middle;" /> in the VS Code status bar (bottom right) to select a Python interpreter that includes the necessary libraries (e.g., torch, safetensors).
 
 ## ⚠️ Requirements
 
