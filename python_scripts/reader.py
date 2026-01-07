@@ -162,7 +162,15 @@ class TorchReader(BaseReader):
     """专门处理 .pt / .pth"""
     def load(self):
         # map_location='cpu' 防止无 GPU 报错
-        self.content = torch.load(self.file_path, map_location='cpu')
+        try:
+            # 针对 PyTorch 2.4+ / 2.6+，显式允许加载完整对象
+            self.content = torch.load(self.file_path, map_location='cpu', weights_only=False)
+        except TypeError:
+            # 针对旧版本 PyTorch (不支持 weights_only 参数)，直接加载
+            self.content = torch.load(self.file_path, map_location='cpu')
+        except Exception as e:
+            # 其他加载错误，抛出以便上层捕获
+            raise e
 
     def _recursive_summary(self, data):
         if isinstance(data, dict):
