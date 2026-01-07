@@ -181,7 +181,8 @@ class TorchReader(BaseReader):
             return {
                 "_type": "tensor",
                 "dtype": str(data.dtype).split('.')[-1],
-                "shape": list(data.shape)
+                "shape": list(data.shape),
+                # "__pth_overview_pth__": {},
             }
         
         # === 核心新增：识别 nn.Module 并展开 ===
@@ -304,6 +305,7 @@ class SafetensorsReader(BaseReader):
                         "_type": "tensor",
                         "dtype": str(slice_info.get_dtype()),
                         "shape": list(slice_info.get_shape()),
+                        # "__pth_overview_pth__": {},
                         "location": "Current File"
                     }
                     # Safetensors 总是扁平 Key，需要构建树
@@ -408,7 +410,8 @@ class JaxReader(BaseReader):
                 "_type": "tensor",
                 "dtype": str(data.dtype),
                 "shape": list(data.shape),
-                "location": "JAX Checkpoint"
+                "location": "JAX Checkpoint",
+                # "__pth_overview_pth__": {},
             }
         elif isinstance(data, (int, float, str, bool, type(None))):
             return data

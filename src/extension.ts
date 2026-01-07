@@ -57,7 +57,7 @@ export function activate(context: vscode.ExtensionContext) {
     // 显示状态栏
     myStatusBarItem.show();
 
-    console.log('PyTorch Viewer Extension is now active!');
+    console.log('PyTorch Structure Viewer Extension is now active!');
 }
 
 /**
