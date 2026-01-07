@@ -183,6 +183,17 @@ class TorchReader(BaseReader):
                 "dtype": str(data.dtype).split('.')[-1],
                 "shape": list(data.shape)
             }
+        
+        # === 核心新增：识别 nn.Module 并展开 ===
+        elif isinstance(data, torch.nn.Module):
+            try:
+                # 将模型对象转换为 state_dict (参数字典)
+                # 这样就能看到 model.0.conv.weight 这样的层级结构了
+                return self._recursive_summary(data.state_dict())
+            except Exception as e:
+                return f"<Model Object: {str(type(data))} (Error expanding: {e})>"
+        # ======================================
+            
         # === 核心修复：把基本类型的处理加回来 ===
         elif isinstance(data, (int, float, str, bool)):
             return data
@@ -224,7 +235,32 @@ class TorchReader(BaseReader):
                         # 可能是极其罕见的非数字索引，或者路径错误
                          obj = obj[k]
                 
-                # === 情况 2: 对象是字典 (核心修改) ===
+                # === 情况 2: PyTorch Module (核心修复) ===
+                elif isinstance(obj, torch.nn.Module):
+                    # 策略 A: 如果 key 包含点 (例如 "model.0.conv.weight")，说明是 state_dict 的键
+                    # 或者是普通的参数名，我们优先查 state_dict
+                    try:
+                        # 注意：频繁调用 state_dict() 在大模型上可能稍慢，但在交互式查看时可接受
+                        sd = obj.state_dict()
+                        if k in sd:
+                            obj = sd[k]
+                            continue
+                    except: pass
+
+                    # 策略 B: 尝试作为属性访问 (例如 obj.model)
+                    if hasattr(obj, k):
+                        obj = getattr(obj, k)
+                    
+                    # 策略 C: 尝试作为索引访问 (例如 Sequential[0])
+                    elif k.isdigit():
+                        try:
+                            obj = obj[int(k)]
+                        except:
+                            raise KeyError(f"Module index {k} out of range")
+                    else:
+                        raise KeyError(f"Cannot find key '{k}' in {type(obj).__name__}")
+                
+                # === 情况 3: 对象是字典 (核心修改) ===
                 else:
                     # 字典查找，直接使用 k (即使 k 里面有点，也没关系)
                     try:
