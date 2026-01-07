@@ -33,7 +33,7 @@
     "commands": [
       {
         "command": "pth-viewer.showPthStructure",
-        "title": "View PTH Structure"
+        "title": "Open with PyTorch Structure Viewer"
       }
     ],
     "customEditors": [
@@ -68,6 +68,15 @@
           "group": "navigation"
         }
       ]
+    },
+    "icons": {
+      "pth-status-icon": {
+        "description": "PTH Viewer Status Icon",
+        "default": {
+          "fontPath": "assets/fonts/status_icon.woff",
+          "fontCharacter": "P"  
+        }
+      }
     }
   },
   "scripts": {

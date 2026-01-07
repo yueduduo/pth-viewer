@@ -1,54 +1,83 @@
-# PyTorch Structure Viewer
+<div align="center">
+  <img src="assets/icon_pth_viewer.png" alt="Logo" width="128" height="128" />
+</div>
 
-快速、清晰地查看 PyTorch/SafeTensor/Jax 模型权重和数据文件（.pth, .pt, .safetensor, .ocdbt）的内部层次结构、Tensor 形状和数据类型。
+<h1 align="center">PyTorch Structure Viewer</h1>
 
-## ✨ 功能特性 (Features)
+<p align="center">
+  快速、清晰地查看 PyTorch / SafeTensor / Jax 模型权重和数据文件的内部层次结构、Tensor 形状和数据类型。
+</p>
+<p align="center">
+  Fast and clear visualization of internal hierarchical structures, tensor shapes, and data types for PyTorch, SafeTensor, and Jax model files.
+</p>
 
-* 树状结构展示
- 
-    将复杂的 Python 字典和列表结构以可折叠的树状视图展示。
+<p align="center">
+  <a href="./README.md">
+    <img alt="README 中文" src="https://img.shields.io/badge/README-中文-red.svg?style=flat-square" />
+  </a>
+  <a href="./README_en.md" style="margin-left: 10px;">
+    <img alt="README English" src="https://img.shields.io/badge/README-English-blue.svg?style=flat-square" />
+  </a>
+  <a href="https://github.com/yueduduo/pth-viewer" style="margin-left: 10px;">
+    <img alt="GitHub Repo" src="https://img.shields.io/badge/GitHub-Repo-black?logo=github&style=flat-square" />
+  </a>
+</p>
 
-* Tensor 元数据与数值查看
+---
+
+## ✨ 功能特性
+
+* **树状结构展示**
     
-    显示Tensor关键元数据（形状 Shape 和数据类型 Dtype）并支持查看详细数值，包括min、max、mean、std统计信息。
+    将复杂的 Python 字典、列表以及模型层级结构以可折叠的树状视图清晰展示，支持一键展开/折叠。
 
-* 编辑器集成
-  
-    点击目标文件即可直接在自定义视图中打开。
+* **Tensor 元数据与数值查看**
+    
+    直观显示 Tensor 的关键元数据（形状 `Shape` 和数据类型 `Dtype`）。支持点击 "🔍" 按钮查看详细数值，包括 `min`、`max`、`mean`、`std` 等统计信息及多维数组预览。
 
-    目前支持的目标文件类型包括: 
+* **编辑器无缝集成**
+    
+    无需编写加载脚本，点击目标文件即可直接在 VS Code 自定义视图中打开。目前支持的文件类型包括：
 
-    | 依赖库|文件扩展名|
-    |-|-|
-    |torch|.pt/.pth|
-    |safetensor|.safetensor|
-    |Jax&orbax|.ocdbt|
+<div align="center">
 
+| 依赖库 (Framework) | 支持的文件扩展名 |
+| :--- | :--- |
+| **PyTorch** | `.pt`, `.pth` |
+| **SafeTensors** | `.safetensors` |
+| **JAX / Orbax** | `.ocdbt` |
 
-## 🚀 使用方法 (Usage)
+</div>
 
-1. 首先需要在VS Code右下角选择插件使用的Python环境。
+## 🚀 使用方法
 
-2. 查看目标文件的方法有两种：
-   * 点击打开: 在资源管理器中，直接点击目标文件。
+### 1. 打开文件
+查看目标文件的方法有两种：
 
-   * 右键菜单: 右键点击目标文件，选择 "View PTH Structure" 命令。
+* **点击打开**: 在 VS Code 资源管理器中，直接单击目标文件即可预览。
+* **右键菜单**: 右键点击目标文件，选择 **Open with PyTorch Structure Viewer** 命令。
 
-## ⚠️ 前置要求 (Requirements)
+### 2. 环境配置
+插件依赖于你本地的 Python 环境。
 
-本扩展依赖于你的本地环境, 包括:
+请首先在 VS Code 右下角的状态栏中，点击本插件图标 <img src="assets/status_icon.svg" height="16" style="vertical-align: middle;" /> ，选择包含相关依赖库（如 torch, safetensors 等）的 Python 解释器。
 
-Python 环境: 你的系统环境变量中必须可以执行 python 命令。
+## ⚠️ 环境要求
 
-    PyTorch 库: 你的 Python 环境中必须安装了 torch 库 (pip install torch)。
+本扩展依赖于你的本地环境，请确保你选择的 Python 环境中已安装以下库（根据你需要查看的文件类型而定）：
 
-    safetensor、Jax&orbax库
+1.  **Python 环境**: 系统中必须有可执行的 python 命令。
+2.  **依赖库**:
+    * **PyTorch**: `pip install torch`
+    * **SafeTensors**: `pip install safetensors`
+    * **JAX & Orbax**: `pip install jax orbax-checkpoint`
 
-    以上库使用cpu版本即可
+    *> 注意：以上库安装 CPU 版本即可，无需 GPU 支持。*
 
+如果缺少这些依赖，插件将无法调用 Python 脚本解析文件，并在视图中显示错误信息。
 
-如果缺少这些依赖，插件将无法调用 Python 脚本来解析文件，并会在视图中显示错误信息。
+## 🔨 开发与贡献
 
-## 🔨 开发与贡献 (Development & Contribution)
+如果你想参与贡献、提交 Bug 或修改此插件，请访问本插件的 [GitHub 仓库](https://github.com/yueduduo/pth-viewer)。
 
-如果你想参与贡献或修改此插件，请访问本插件的 [GitHub](https://github.com/yueduduo/pth-viewer) 仓库
+欢迎 Star 和 PR！

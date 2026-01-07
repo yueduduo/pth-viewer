@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { PthEditorProvider } from './PthEditorProvider'; // 导入自定义编辑器类
 import { getPythonInterpreterPath, onDidChangePythonInterpreter } from './pythonApi';
 import * as path from 'path';
+import { t } from './i18n';         // <--- for 多语言
 
 let myStatusBarItem: vscode.StatusBarItem;
 
@@ -25,7 +26,7 @@ export function activate(context: vscode.ExtensionContext) {
             // 使用 VS Code 内部命令，强制以我们的自定义编辑器类型打开文件
             vscode.commands.executeCommand('vscode.openWith', uri, PthEditorProvider.viewType);
         } else {
-            vscode.window.showErrorMessage("请在资源管理器中右键点击 .pth 或 .pt 文件使用此功能");
+            vscode.window.showErrorMessage(t('file_right_click_tip'));
         }
     });
     context.subscriptions.push(disposableCommand);
@@ -80,8 +81,8 @@ async function updateStatusBarItem() {
             displayName = `Python (${dirName})`;
         }
 
-        myStatusBarItem.text = `$(python) ${displayName}`; // 使用 VS Code 内置的 python 图标
-        myStatusBarItem.tooltip = `PyTorch Viewer正在使用的Python解释器: ${pythonPath}。点击切换。`;
+        myStatusBarItem.text = `$(pth-status-icon) ${displayName}`; // 使用 VS Code 内置的 python 图标
+        myStatusBarItem.tooltip = `${t('status_python_tooltip_front')} ${pythonPath} ${t('status_python_tooltip_back')}`;
 
     } catch (error) {
         myStatusBarItem.text = `$(alert) Python Error`;

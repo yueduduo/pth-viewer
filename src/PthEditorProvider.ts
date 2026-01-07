@@ -4,7 +4,7 @@ import * as path from 'path';
 import * as fs from 'fs';           // <--- for 缓存
 import * as crypto from 'crypto';   // <--- for 缓存
 import { getPythonInterpreterPath } from './pythonApi';
-
+import { t } from './i18n';         // <--- for 多语言
 /**
  * 定义一个简单的文档类，用于持有文件的 Uri
  */
@@ -90,9 +90,9 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
         panel.webview.html = getWebviewContent(`
             <div class="loading">
                 <div class="spinner"></div>
-                <p>正在解析模型结构... ${this.forceLocal ? '(单文件模式)' : '(自动检测索引)'}</p>
-                请确保你选择了正确的 Python 环境 (需包含 torch|safetensors|Jax&orbax 库)。
-                <p style="font-size:0.8em; color:var(--vscode-descriptionForeground);">大型文件首次加载需要较长时间，后续将使用缓存秒开。</p>
+                <p>${t('loading_parsing')}... ${this.forceLocal ? t('loading_single_mode') : t('loading_auto_mode')}</p>
+                ${t('loading_env_check')}
+                <p style="font-size:0.8em; color:var(--vscode-descriptionForeground);">${t('loading_cache_tip')}</p>
             </div>
         `, panel.webview);
         
@@ -144,9 +144,9 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
                 // ... 错误处理代码 ...
                 // 可以在这里提示用户检查 Python 环境
                 panel.webview.html = getWebviewContent(
-                    `<h3>Python 运行错误:</h3>
-                     <p>请检查 VS Code 右下角选择的 Python 环境是否已安装 PyTorch|safetensors|Jax&orbax。</p>
-                     <p>当前尝试使用的 Python 路径: <code>${pythonExecutable}</code></p>
+                    `<h3>${t('err_python_run')}</h3>
+                     <p>${t('err_python_env')}</p>
+                     <p>${t('err_python_path')} <code>${pythonExecutable}</code></p>
                      <pre>${err.message}</pre>
                      <h4>Stderr:</h4><pre>${stderr}</pre>`, 
                     panel.webview
@@ -160,7 +160,7 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
                 
                 if (this.cacheJson.error) {
                     panel.webview.html = getWebviewContent(
-                        `<h3>数据读取错误:</h3><pre>${this.cacheJson.error}</pre>`, 
+                        `<h3>${t('err_data_read')}:</h3><pre>${this.cacheJson.error}</pre>`, 
                         panel.webview
                     );
                 } else {
@@ -178,7 +178,7 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
                 }
             } catch (e: any) {
                 panel.webview.html = getWebviewContent(
-                    `<h3>JSON 解析失败 (Python 输出非标准JSON):</h3><pre>${stdout}</pre>`,
+                    `<h3>${t('err_json_parse')}:</h3><pre>${stdout}</pre>`,
                     panel.webview
                 );
             }
@@ -378,23 +378,23 @@ function generatePageHtml(result: any, isForceLocal: boolean): string {
         controlBar = `
             <div class="status-bar global-mode">
                 <span class="icon">🌐</span> 
-                <span><strong>全局视图:</strong> 已加载索引 <code>${indexFile}</code></span>
-                <button onclick="vscode.postMessage({command: 'switchMode', value: true})">切换为只看当前文件</button>
+                <span><strong>${t('view_global_title')}:</strong> ${t('view_global_loaded')} <code>${indexFile}</code></span>
+                <button onclick="vscode.postMessage({command: 'switchMode', value: true})">${t('btn_switch_to_single')}</button>
             </div>
         `;
     } else if (isForceLocal) {
         controlBar = `
             <div class="status-bar local-mode">
                 <span class="icon">📄</span> 
-                <span><strong>单文件视图:</strong> 仅显示当前文件内容</span>
-                <button onclick="vscode.postMessage({command: 'switchMode', value: false})">尝试检测全局索引</button>
+                <span><strong>${t('view_single_title')}:</strong> ${t('view_single_only')}</span>
+                <button onclick="vscode.postMessage({command: 'switchMode', value: false})">${t('btn_switch_to_global')}</button>
             </div>
         `;
     } else {
         controlBar = `
             <div class="status-bar local-mode">
                 <span class="icon">📄</span> 
-                <span>单文件视图 (未检测到索引)</span>
+                <span>${t('view_single_no_index')}</span>
             </div>
         `;
     }
@@ -667,12 +667,12 @@ export function generateJsonHtml(data: any, keyPath: string[] = []): string {
         // 3. 生成唯一 ID (CSS ID 不能有特殊字符，这里简单的替换一下即可，或者用 safePath 做 ID 的一部分)
         const btnId = `btn-${safePath.replace(/[^a-zA-Z0-9]/g, '-')}`; 
 
-        const detailStr = data._type === 'tensor' ? `${shapeStr} (${dtype})` : `(索引引用)`;
+        const detailStr = data._type === 'tensor' ? `${shapeStr} (${dtype})` : `${t('tag_ref')}`;
         
         // 注意：onclick 这里我们要传 safePath，后端拿到后再 decodeURIComponent
         // 但其实 postMessage 可以直接传对象，我们这里为了简单，传 safePath 字符串
         const inspectBtn = data._type === 'tensor' 
-            ? `<span class="inspect-btn" title="查看/折叠" onclick="toggleInspect('${safePath}', '${btnId}')">🔍</span>` 
+            ? `<span class="inspect-btn" title="${t('btn_inspect_title')}" onclick="toggleInspect('${safePath}', '${btnId}')">🔍</span>` 
             : '';
 
         tensorHtml = `<span class="${infoClass}">${detailStr}</span>${loc} ${inspectBtn} <div id="${btnId}" class="data-preview" style="display:none;"></div>`;

@@ -364,7 +364,6 @@ class JaxReader(BaseReader):
             sharding = None
 
         # 使用 Orbax 恢复 Checkpoint
-        # 参考了你提供的 load_jax_weights 逻辑
         with ocp.PyTreeCheckpointer() as ckptr:
             # 1. 读取元数据
             metadata = ckptr.metadata(target_path)
