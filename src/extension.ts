@@ -3,10 +3,11 @@ import { PthEditorProvider } from './PthEditorProvider'; // 导入自定义编�
 import { getPythonInterpreterPath, onDidChangePythonInterpreter } from './pythonApi';
 import * as path from 'path';
 import { t } from './i18n';         // <--- for 多语言
+import { PythonServerManager } from './PythonServerManager'; // 上一步写的 Manager
 
 let myStatusBarItem: vscode.StatusBarItem;
 
-export function activate(context: vscode.ExtensionContext) {
+export async function activate(context: vscode.ExtensionContext) {
 
     // 1. 注册自定义编辑器提供程序 (双击打开功能)
     context.subscriptions.push(
@@ -47,13 +48,45 @@ export function activate(context: vscode.ExtensionContext) {
     myStatusBarItem.command = 'pth-viewer.selectPython'; // 点击时执行上面的命令
     context.subscriptions.push(myStatusBarItem);
 
-    // 5. 初始化状态栏显示，并监听环境变化
-    updateStatusBarItem();
-    // 当 Python 官方插件通知我们环境变了，我们更新状态栏
-    // 注意：这里只是更新状态栏文字显示，实际解析时 PthEditorProvider 会实时获取最新路径
-    onDidChangePythonInterpreter(() => {
-        updateStatusBarItem();
+    // 5. 初始化状态栏显示，并注册环境变化监听
+    // 初始化 Manager
+    const manager = PythonServerManager.getInstance();
+    manager.setContext(context);
+
+    // === 核心修复开始: 启动时准确获取当前环境并同步给 Manager ===
+    
+    // 获取当前活跃的编辑器 URI (这样能拿到 Anaconda 的特定环境，而不是默认的 'python')
+    const activeUri = vscode.window.activeTextEditor?.document.uri;
+    
+    // 获取路径
+    const initialPath = await getPythonInterpreterPath(activeUri);
+    
+    console.log("[Extension] Initializing Python path:", initialPath);
+    // 立即告诉 Manager 使用这个路径，不要让它自己用 'python'
+    await manager.changePythonInterpreter(initialPath);
+    
+    // 更新状态栏 UI
+    updateStatusBarItem(initialPath);
+
+    // === 核心修复结束 ===
+
+    // 6. 监听环境变化
+    onDidChangePythonInterpreter((newPath: string) => {
+        console.log("[Extension] Python interpreter changed to:", newPath);
+        manager.changePythonInterpreter(newPath);
+        updateStatusBarItem(newPath);
     }, context);
+
+    // 7. 监听当前打开的文件变化 (因为不同文件可能用不同环境)
+    context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(async (editor) => {
+        if (editor) {
+            const p = await getPythonInterpreterPath(editor.document.uri);
+            updateStatusBarItem(p);
+
+            // 策略：如果路径变了才重启 Server。Manager.changePythonInterpreter 内部有判断逻辑，重复路径会忽略，所以直接调没事。
+            manager.changePythonInterpreter(p);
+        }
+    }));
     
     // 显示状态栏
     myStatusBarItem.show();
@@ -62,28 +95,30 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 /**
- * 更新状态栏显示的文字
+ * 辅助函数：更新状态栏
+ * 接收 path 参数，避免重复查询
  */
-async function updateStatusBarItem() {
+function updateStatusBarItem(pythonPath: string) {
     try {
-        // 获取当前活动的编辑器资源，用于确定工作区
-        const activeEditor = vscode.window.activeTextEditor;
-        const resource = activeEditor?.document.uri;
-
-        const pythonPath = await getPythonInterpreterPath(resource);
-        
-        // 尝试从路径中提取版本号或环境名称，让显示更友好
-        // 这里做一个简单的处理，显示 python 可执行文件的父目录名（通常是环境名）
         let displayName = 'System Python';
+        
+        // 简单的显示逻辑优化
         if (pythonPath !== 'python') {
-            const dirName = path.basename(path.dirname(pythonPath));
-             // 如果是 venv/conda 环境，目录名通常有意义
-            displayName = `Python (${dirName})`;
+            // 尝试提取环境名，例如: .../anaconda3/envs/myenv/python.exe -> myenv
+            // 或者是 .../anaconda3/python.exe -> anaconda3
+            const parentDir = path.dirname(pythonPath);
+            const envName = path.basename(parentDir); 
+            
+            // 如果是在 Scripts 目录下 (Windows venv)，再往上一级找
+            if (envName.toLowerCase() === 'scripts' || envName.toLowerCase() === 'bin') {
+                 displayName = `Python (${path.basename(path.dirname(parentDir))})`;
+            } else {
+                 displayName = `Python (${envName})`;
+            }
         }
 
-        myStatusBarItem.text = `$(pth-status-icon) ${displayName}`; // 使用 VS Code 内置的 python 图标
+        myStatusBarItem.text = `$(pth-status-icon) ${displayName}`; //  使用图标
         myStatusBarItem.tooltip = `${t('status_python_tooltip_front')} ${pythonPath} ${t('status_python_tooltip_back')}`;
-
     } catch (error) {
         myStatusBarItem.text = `$(alert) Python Error`;
     }

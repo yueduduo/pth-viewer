@@ -292,24 +292,42 @@ class TorchReader(BaseReader):
 # ==========================================
 
 class SafetensorsReader(BaseReader):
+    
+    def load(self):
+        """核心修改：将 safe_open 对象赋值给 self.content 进行缓存，不再使用 with 关闭"""
+        if not HAS_SAFETENSORS:
+            raise ImportError("Missing library: safetensors")
+        
+        # 注意：safe_open 返回的对象在 Python 引用计数归零时会自动释放资源 (Rust Binding)
+        # 所以直接赋值给 self.content 是安全的，只要 Server 端执行 del 操作即可释放
+        self.content = safe_open(self.file_path, framework="pt", device="cpu")
+
     def get_structure(self):
         if not HAS_SAFETENSORS:
             return {"error": "Missing library: safetensors"}
         
+        # 1. 懒加载：如果缓存为空，则加载
+        if self.content is None:
+            try:
+                self.load()
+            except Exception as e:
+                return {"error": f"Load failed: {str(e)}"}
+        
         tree = {}
         try:
-            with safe_open(self.file_path, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    slice_info = f.get_slice(key)
-                    info = {
-                        "_type": "tensor",
-                        "dtype": str(slice_info.get_dtype()),
-                        "shape": list(slice_info.get_shape()),
-                        # "__pth_overview_pth__": {},
-                        "location": "Current File"
-                    }
-                    # Safetensors 总是扁平 Key，需要构建树
-                    insert_into_tree(tree, key.split('.'), info)
+            # 2. 直接使用缓存的 self.content
+            f = self.content
+            
+            for key in f.keys():
+                slice_info = f.get_slice(key)
+                info = {
+                    "_type": "tensor",
+                    "dtype": str(slice_info.get_dtype()),
+                    "shape": list(slice_info.get_shape()),
+                    "location": "Current File"
+                }
+                # Safetensors 总是扁平 Key，需要构建树
+                insert_into_tree(tree, key.split('.'), info)
         except Exception as e:
             return {"error": str(e)}
         return tree
@@ -317,6 +335,13 @@ class SafetensorsReader(BaseReader):
     def get_tensor_data(self, key_path_json):
         if not HAS_SAFETENSORS:
             return {"error": "Missing library: safetensors"}
+        
+        # 1. 懒加载
+        if self.content is None:
+            try:
+                self.load()
+            except Exception as e:
+                return {"error": f"Load failed: {str(e)}"}
         
         try:
             keys = json.loads(key_path_json)
@@ -327,11 +352,10 @@ class SafetensorsReader(BaseReader):
             return {"error": "Invalid JSON key path"}
 
         try:
-            with safe_open(self.file_path, framework="pt", device="cpu") as f:
-                # safe_open 不支持直接随机读取，但 get_tensor 很快！！！！！TODO
-                # 注意：这会把 Tensor 加载到内存
-                tensor = f.get_tensor(flat_key)
-                return format_tensor_stats(tensor)
+            # 2. 直接从缓存句柄读取，极大提升速度
+            f = self.content
+            tensor = f.get_tensor(flat_key)
+            return format_tensor_stats(tensor)
         except Exception as e:
              return {"error": f"Failed to retrieve tensor: {flat_key} ({str(e)})"}
 
@@ -490,6 +514,27 @@ def read_global_index(index_path, current_file_name):
             index_data = json.load(f)
         
         weight_map = index_data.get("weight_map", {})
+        
+        # ========================================================
+        # 新增逻辑：计算整个模型(所有分片)的总大小
+        # ========================================================
+        total_size = 0
+        base_dir = os.path.dirname(index_path)
+        
+        # 1. 收集所有涉及的唯一文件名 (weight_map values 可能重复，用 set 去重)
+        related_files = set(weight_map.values())
+        
+        # 2. 累加所有权重文件的大小
+        for fname in related_files:
+            full_path = os.path.join(base_dir, fname)
+            if os.path.exists(full_path):
+                total_size += os.path.getsize(full_path)
+                
+        # 3. 加上索引文件本身的大小 (通常很小，但为了严谨)
+        if os.path.exists(index_path):
+            total_size += os.path.getsize(index_path)
+        # ========================================================
+
         tree = {}
         for key, filename in weight_map.items():
             loc_str = "Current File" if filename == current_file_name else f"File: {filename}"
@@ -499,7 +544,12 @@ def read_global_index(index_path, current_file_name):
             }
             insert_into_tree(tree, key.split('.'), info)
             
-        return {"is_global": True, "index_file": os.path.basename(index_path), "data": tree}
+        return {
+            "is_global": True, 
+            "index_file": os.path.basename(index_path), 
+            "total_size": total_size,  # <--- 将计算好的总大小返回给前端
+            "data": tree
+        }
     except Exception as e:
         return {"error": f"Index read failed: {str(e)}"}
 

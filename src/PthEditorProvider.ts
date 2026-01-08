@@ -1,10 +1,9 @@
 import * as vscode from 'vscode';
-import * as cp from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';           // <--- for 缓存
 import * as crypto from 'crypto';   // <--- for 缓存
-import { getPythonInterpreterPath } from './pythonApi';
 import { t } from './i18n';         // <--- for 多语言
+import { PythonServerManager } from './PythonServerManager'; // 引入 PythonServerManager
 /**
  * 定义一个简单的文档类，用于持有文件的 Uri
  */
@@ -16,7 +15,20 @@ class PthDocument implements vscode.CustomDocument {
     }
 
     dispose(): void {
-        // 如果有资源需要释放，在这里处理。目前我们不需要做任何事。
+        // 如果有资源需要释放，在这里处理。
+        // === 关键：文件关闭时，通知后端释放内存 ===
+        console.log(`[Document] Disposing ${this.uri.fsPath}`);
+        PythonServerManager.getInstance().sendRequest('/release', {
+            file_path: this.uri.fsPath
+        }).then(response => {
+            console.log(response.error)
+            if (response?.status === 'released') {
+                console.log(`[Document] Successfully released ${this.uri.fsPath}`);
+            } else {
+                console.error(`[Document] Failed to release ${this.uri.fsPath}`);
+            }
+        }).catch(err => console.error("Failed to release model:", err));
+
     }
 }
 
@@ -34,7 +46,10 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
     private cacheFilePath: string = '';
     private cacheHash: string | null = '';
 
-    constructor(private readonly context: vscode.ExtensionContext) { }
+    constructor(private readonly context: vscode.ExtensionContext) {
+        // 初始化 Manager
+        PythonServerManager.getInstance().setContext(context);
+     }
 
     // ----------------------------------------------------
     //  方法 1 (必须): 打开文档
@@ -66,7 +81,7 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
         };
 
         // 监听 Webview 发来的消息
-        webviewPanel.webview.onDidReceiveMessage(message => {
+        webviewPanel.webview.onDidReceiveMessage(async message => {
             // 监听 模式 切换
             if (message.command === 'switchMode') {
                 this.forceLocal = message.value; // update: true = 强制局部, false = 自动全局
@@ -78,6 +93,34 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
                 const elementId = message.id;
                 this.inspectTensorData(document.uri.fsPath, key, elementId, webviewPanel);
             }
+
+            // 监听 reload 
+            if (message.command === 'reload') {
+                console.log("[Editor] Reloading...");
+                
+                // 1. 尝试删除物理缓存文件
+                if (fs.existsSync(this.cacheFilePath)) {
+                    try {
+                        fs.unlinkSync(this.cacheFilePath); // 删除文件
+                        console.log(`[Cache] Deleted stale cache: ${this.cacheFilePath}`);
+                    } catch (e) {
+                        console.error("[Cache] Failed to delete cache:", e);
+                    }
+                }
+
+                // 2. 通知 Python 后端释放内存 (清除 LOADED_MODELS)
+                try {
+                    await PythonServerManager.getInstance().sendRequest('/release', {
+                        file_path: this.filePath
+                    });
+                } catch (e) { console.warn("Failed to release backend memory:", e); }
+
+                // 3. 清空前端内存对象
+                this.cacheJson = {}; 
+                
+                // 4. 重新加载 (这会触发全新的 /load 请求并重新生成缓存)
+                this.loadPthContent(document, webviewPanel);
+            }
         });
 
         // 初始加载 (默认尝试全局)
@@ -86,10 +129,18 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
 
     // 抽离加载逻辑，方便刷新
     private async loadPthContent(document: PthDocument, panel: vscode.WebviewPanel) {
-        // 1. 显示加载动画
+        // 计算文件大小
+        let fileSizeStr = "0 B";
+        try {
+            const stats = fs.statSync(this.filePath);
+            fileSizeStr = formatFileSize(stats.size);
+        } catch (e) { console.error(e); }
+
+        // 1. 显示加载动画 显示文件大小
         panel.webview.html = getWebviewContent(`
             <div class="loading">
                 <div class="spinner"></div>
+                <p>${t('loading_file_size')}: ${fileSizeStr}</p>
                 <p>${t('loading_parsing')}... ${this.forceLocal ? t('loading_single_mode') : t('loading_auto_mode')}</p>
                 ${t('loading_env_check')}
                 <p style="font-size:0.8em; color:var(--vscode-descriptionForeground);">${t('loading_cache_tip')}</p>
@@ -105,8 +156,17 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
                 const cacheRaw = fs.readFileSync(this.cacheFilePath, 'utf-8');                    
                 this.cacheJson = JSON.parse(cacheRaw).data;
 
+                let totalSizeBytes = 0;
+                // 情况 1: Python 后端返回了计算好的总大小 (Global 模式)
+                if (this.cacheJson && this.cacheJson.total_size) {
+                    totalSizeBytes = this.cacheJson.total_size;
+                    console.log(`[Size] Using size calculated by Python: ${totalSizeBytes}`);
+                    fileSizeStr = formatFileSize(totalSizeBytes);
+                } 
+                // 情况 2: 单文件模式 (或者 Python 端没有返回 total_size)
+                else {}
                 // 渲染缓存的数据
-                const htmlTree = generatePageHtml(this.cacheJson, this.forceLocal);
+                const htmlTree = generatePageHtml(this.cacheJson, this.forceLocal, fileSizeStr);
                 
                 // 可以在界面上加一个小标记提示是缓存内容 (可选)
                 // 这里的 render 调用保持不变
@@ -120,44 +180,24 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
         
 
         // 3. === 缓存未命中，运行 Python 解析 ===
-        const scriptPath = path.join(this.context.extensionPath, 'python_scripts', 'reader.py');
-        
-        // python 
-        // 动态获取当前选中的 Python 解释器路径
-        // 传入当前文档的 uri，以处理多工作区的情况
-        let pythonExecutable = await getPythonInterpreterPath(document.uri);
-        
-        // 为了处理路径中可能存在的空格（特别是在 Windows 上），给路径加上双引号
-        // 如果已经是 'python' 系统命令则不需要加，这里做个简单判断
-        if (pythonExecutable !== 'python') {
-            pythonExecutable = `"${pythonExecutable}"`;
-        }
+        try {
+            console.log("Requesting load from Python Server...");
+            // 替代原来的 cp.exec
+            const result = await PythonServerManager.getInstance().sendRequest('/load', {
+                file_path: this.filePath,
+                force_local: this.forceLocal
+            });
 
-        // 构建最终执行命令
-        // 根据模式添加参数
-        const args = this.forceLocal ? ' --force-local' : '';
-        const command = `${pythonExecutable} "${scriptPath}" "${this.filePath}"${args}`;
-        console.log("Executing command:", command);
-
-        cp.exec(command, { maxBuffer: 1024 * 1024 * 50 }, (err, stdout, stderr) => {
-            if (err) {
-                // ... 错误处理代码 ...
-                // 可以在这里提示用户检查 Python 环境
+            if (result.error) {
+                // 这是 Python 服务器内部捕获的错误  Python 已经正常启动 但是 出错
                 panel.webview.html = getWebviewContent(
-                    `<h3>${t('err_python_run')}</h3>
-                     <p>${t('err_python_env')}</p>
-                     <p>${t('err_python_path')} <code>${pythonExecutable}</code></p>
-                     <pre>${err.message}</pre>
-                     <h4>Stderr:</h4><pre>${stderr}</pre>`, 
+                    `<h3>${t('err_parse_error')}</h3><pre>${result.error}</pre>`, 
                     panel.webview
                 );
-                return;
-            }
-
-            try {
+            } else {
                 // 4. 解析 Python 返回的 JSON
-                this.cacheJson = JSON.parse(stdout);
-                
+                this.cacheJson = result; // 结果格式应该和原来一致
+
                 if (this.cacheJson.error) {
                     panel.webview.html = getWebviewContent(
                         `<h3>${t('err_data_read')}:</h3><pre>${this.cacheJson.error}</pre>`, 
@@ -172,17 +212,66 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
                         console.error("[Cache] Write failed:", e);
                     }
 
+                    let totalSizeBytes = 0;
+                    // 情况 1: Python 后端返回了计算好的总大小 (Global 模式)
+                    if (this.cacheJson && this.cacheJson.total_size) {
+                        totalSizeBytes = this.cacheJson.total_size;
+                        console.log(`[Size] Using size calculated by Python: ${totalSizeBytes}`);
+                        fileSizeStr = formatFileSize(totalSizeBytes);
+                    } 
+                    // 情况 2: 单文件模式 (或者 Python 端没有返回 total_size)
+                    else {}
                     // 6. 生成 HTML 树状图并显示
-                    const htmlTree = generatePageHtml(this.cacheJson, this.forceLocal);
+                    const htmlTree = generatePageHtml(this.cacheJson, this.forceLocal, fileSizeStr);
                     panel.webview.html = getWebviewContent(htmlTree, panel.webview);
                 }
-            } catch (e: any) {
-                panel.webview.html = getWebviewContent(
-                    `<h3>${t('err_json_parse')}:</h3><pre>${stdout}</pre>`,
-                    panel.webview
-                );
             }
-        });
+        } catch (e: any) {
+            // 捕获Python启动失败的异常
+            console.error("Load failed:", e);
+            const errorMsg = e.message || "Unknown error";
+
+            // 区分错误类型
+            // 情况 A: 超时错误 -> 显示在 Tooltip (Toast)
+            if (errorMsg.includes("Timeout")) {
+                vscode.window.showErrorMessage(`${t('loading_failed_overtime')}: ${errorMsg}. ${t('loading_failed_retry')}`);
+
+                // 页面上可以显示一个重试按钮，而不是全屏报错
+                panel.webview.html = getWebviewContent(`
+                    <div style="padding: 20px; text-align: center;">
+                        <h3>⏱️ Request Timeout</h3>
+                        <p>Python ${t('loading_server_timeout')}</p>
+                        <button onclick="location.reload()">Retry</button>
+                    </div>
+                `, panel.webview);
+            }
+            
+            // 情况 B: 启动错误/环境错误 (含 9009, ModuleNotFound, UnicodeError 等) -> 显示在页面 (Webview)
+            const manager = PythonServerManager.getInstance();
+            // 获取当前使用的解释器路径，用于展示给用户
+            const currentPyPath = manager.getInterpreterPath(); 
+
+            // 渲染详细的错误页面 (恢复之前的经典报错样式)
+            panel.webview.html = getWebviewContent(
+                `
+                <div style="padding: 10px; border: 1px solid var(--vscode-inputValidation-errorBorder); border-radius: 5px;">
+                    <h3 style="margin-top:0;">${t('err_python_run')}</h3>
+                    
+                    <p><strong>${t('err_python_env')}</strong></p>
+                    
+                    <p>${t('err_python_path')} <code style="background:var(--vscode-textBlockQuote-background); padding:2px 4px;">${currentPyPath}</code></p>
+                    
+                    <hr style="border: 0; border-top: 1px solid var(--vscode-textBlockQuote-border);">
+                    
+                    <h4>${t('err_stderr_output')}</h4>
+                    <pre style="color:var(--vscode-errorForeground); overflow:auto; max-height:300px;">${errorMsg}</pre>
+                </div>
+                `, 
+                panel.webview
+            );
+        }
+       
+
     }
 
     
@@ -214,34 +303,17 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
             console.warn("[Cache] Failed to read/parse cache for tensor inspection:", e);
         }
 
-
-        // 3. === 缓存未命中，请求 Python ===
-        const scriptPath = path.join(this.context.extensionPath, 'python_scripts', 'reader.py');
-        let pythonExecutable = await getPythonInterpreterPath(undefined);
-        if (pythonExecutable !== 'python') pythonExecutable = `"${pythonExecutable}"`;
-
-        // 注意：message.key 已经是 JSON 字符串了 '["policy", "net.0.weight"]'
-        // 我们需要把这个字符串安全地放在命令行参数里。
-        // 在 Windows Powershell/CMD 中，内部的双引号需要转义，或者外层用单引号（视情况而定）。
-        // 最简单的方法：把 JSON 里的双引号转义一下，或者直接依靠 cp.exec 的自动处理(如果有的话，但通常没有)。
-        
-        // 简单粗暴但有效的转义：把双引号变成转义的双引号
-        const escapedKey = key.replace(/"/g, '\\"'); 
-        
-        // 最终命令类似于: python reader.py file.pth --action data --key "[\"policy\", \"net.0.weight\"]"
-        const command = `${pythonExecutable} "${scriptPath}" "${filePath}" --action data --key "${escapedKey}"`;
-        
-        cp.exec(command, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
-            if (err) {
-                // 发消息回 Webview 显示错误
-                panel.webview.postMessage({ command: 'showData', id: elementId, error: err.message });
-                return;
-            }
-            try {
-                const result = JSON.parse(stdout);
-                // 发消息回 Webview 显示数据
+        // 3. === 缓存未命中，请求 Server ===
+        try {
+            const result = await PythonServerManager.getInstance().sendRequest('/inspect', {
+                file_path: filePath,
+                key: key // 直接传 JSON 字符串，Server 端会解析
+            });
+            if (result.error) {
+                 panel.webview.postMessage({ command: 'showData', id: elementId, error: result.error });
+            } else {
                 panel.webview.postMessage({ command: 'showData', id: elementId, data: result });
-                // 显示从python获取了数据 console.log
+                 // 显示从python获取了数据 console.log
                 console.log(`[Python] Get overview data for ${keys.join('.')}`);
                 
                 // 4. === 异步写入缓存 (Update __pth_overview_pth__) ===
@@ -272,10 +344,10 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
                         console.error("[Cache] Error updating JSON structure:", updateErr);
                     }
                 }
-            } catch (e: any) {
-                panel.webview.postMessage({ command: 'showData', id: elementId, error: "Parse Error" });
-            }
-        });
+            } 
+        } catch (e: any) {
+            panel.webview.postMessage({ command: 'showData', id: elementId, error: "Server Error: " + e.message });
+        }
     }
 
     // ----------------------------------------------------------------------
@@ -366,38 +438,52 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
 //  辅助函数 (保持不变)
 // ----------------------------------------------------
 
-function generatePageHtml(result: any, isForceLocal: boolean): string {
+function generatePageHtml(result: any, isForceLocal: boolean, fileSizeStr: string): string {
     const isGlobal = result.is_global;
     const data = result.data;
     const indexFile = result.index_file || "";
 
-    // 控制栏 HTML
-    let controlBar = '';
-    
+    // 定义图标和标题文本
+    let icon = isGlobal ? '🌐' : '📄';
+    let title = isGlobal ? t('view_global_title') : t('view_single_title');
+    let desc = '';
+    let statusClass = isGlobal ? 'global-mode' : 'local-mode';
+    let switchBtnText = isGlobal ? t('btn_switch_to_single') : t('btn_switch_to_global');
+    let switchCmdValue = isGlobal ? 'true' : 'false'; // true=forceLocal
+
     if (isGlobal) {
-        controlBar = `
-            <div class="status-bar global-mode">
-                <span class="icon">🌐</span> 
-                <span><strong>${t('view_global_title')}:</strong> ${t('view_global_loaded')} <code>${indexFile}</code></span>
-                <button onclick="vscode.postMessage({command: 'switchMode', value: true})">${t('btn_switch_to_single')}</button>
-            </div>
-        `;
+        desc = `${t('view_global_loaded')} <code>${indexFile}</code>`;
     } else if (isForceLocal) {
-        controlBar = `
-            <div class="status-bar local-mode">
-                <span class="icon">📄</span> 
-                <span><strong>${t('view_single_title')}:</strong> ${t('view_single_only')}</span>
-                <button onclick="vscode.postMessage({command: 'switchMode', value: false})">${t('btn_switch_to_global')}</button>
-            </div>
-        `;
+        desc = t('view_single_only');
     } else {
-        controlBar = `
-            <div class="status-bar local-mode">
-                <span class="icon">📄</span> 
-                <span>${t('view_single_no_index')}</span>
-            </div>
-        `;
+        desc = t('view_single_no_index');
     }
+
+    // === 核心修改：使用 Flex 布局的控制栏 ===
+    // 结构：
+    // <div class="status-bar ...">
+    //    <div class="status-left"> 图标 | 标题 | 描述 | [文件大小Badge] </div>
+    //    <div class="status-right"> [刷新按钮] [切换模式按钮] </div>
+    // </div>
+
+    let controlBar = `
+        <div class="status-bar ${statusClass}">
+            <div class="status-left">
+                <span class="icon">${icon}</span> 
+                <span class="status-title">${title}</span>
+                <span class="status-desc">${desc}</span>
+                <span class="size-badge">${fileSizeStr}</span>
+            </div>
+            <div class="status-right">
+                <button class="icon-btn" onclick="vscode.postMessage({command: 'reload'})" title="${t('btn_reload')}">
+                    <span class="codicon-symbol">↻</span> ${t('btn_reload')}
+                </button>
+                <button style="display:${isGlobal || isForceLocal ? 'inline-block' : 'none'}" onclick="vscode.postMessage({command: 'switchMode', value: ${switchCmdValue}})">
+                    ${switchBtnText}
+                </button>
+            </div>
+        </div>
+    `;
 
     const treeHtml = generateJsonHtml(data);
     return controlBar + treeHtml;
@@ -423,30 +509,89 @@ export function getWebviewContent(bodyContent: string, webview?: vscode.Webview)
             }
 
             /* 状态栏样式 */
+            /* 1. 改造 status-bar 为 Flex 容器 */
             .status-bar {
-                padding: 8px 12px;
+                padding: 6px 10px; /*稍微减小padding更精致*/
                 margin-bottom: 15px;
                 border-radius: 4px;
                 display: flex;
                 align-items: center;
-                gap: 10px;
+                justify-content: space-between; /* 左右推开 */
                 font-size: 0.9em;
                 border: 1px solid var(--vscode-widget-border);
+                /* 保持原来的背景色逻辑 (.global-mode / .local-mode) */
             }
-            .global-mode { background-color: var(--vscode-notebook-cellInsertedBackground); border-left: 4px solid var(--vscode-notebook-statusSuccessIcon-foreground); }
-            .local-mode { background-color: var(--vscode-notebook-cellDeletedBackground); border-left: 4px solid var(--vscode-notebook-statusErrorIcon-foreground); }
-            
+
+            /* 左侧区域：子元素紧凑排列 */
+            .status-left {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                overflow: hidden; /* 防止文件名过长溢出 */
+            }
+
+            .status-title {
+                font-weight: bold;
+                white-space: nowrap;
+            }
+
+            .status-desc {
+                opacity: 0.9;
+                white-space: nowrap;
+                text-overflow: ellipsis;
+                overflow: hidden;
+            }
+
+            /* 右侧区域：按钮组 */
+            .status-right {
+                display: flex;
+                gap: 8px;
+                flex-shrink: 0; /* 防止按钮被压缩 */
+            }
+
+            /* 2. 文件大小 Badge 样式 (仿 VS Code Badge) */
+            .size-badge {
+                background-color: var(--vscode-badge-background);
+                color: var(--vscode-badge-foreground);
+                font-size: 0.85em;
+                padding: 1px 6px;
+                border-radius: 10px; /* 圆角 */
+                font-family: var(--vscode-editor-font-family);
+                min-width: 40px;
+                text-align: center;
+                border: 1px solid var(--vscode-contrastBorder, transparent); /* 高对比度模式支持 */
+            }
+
+            /* 3. 按钮样式优化 */
             button {
-                margin-left: auto;
                 background: var(--vscode-button-background);
                 color: var(--vscode-button-foreground);
                 border: none;
-                padding: 4px 8px;
+                padding: 4px 10px;
                 border-radius: 2px;
                 cursor: pointer;
+                font-family: inherit;
+                display: flex;
+                align-items: center;
+                gap: 4px;
+                transition: background 0.1s;
             }
-            button:hover { background: var(--vscode-button-hoverBackground); }
 
+            button:hover {
+                background: var(--vscode-button-hoverBackground);
+            }
+
+            /* 特殊的图标按钮样式 (可选，让刷新按钮看起来稍微不同) */
+            .icon-btn .codicon-symbol {
+                font-weight: bold;
+                font-size: 1.1em;
+                line-height: 1;
+            }
+
+            /* 移动端适配 (如果窗口很窄) */
+            @media (max-width: 600px) {
+                .status-desc { display: none; } /* 窄屏隐藏描述文字 */
+            }
             /* 2. 标题样式 */
             h2 {
                 color: var(--vscode-editorWidget-foreground);
@@ -715,4 +860,15 @@ export function generateJsonHtml(data: any, keyPath: string[] = []): string {
     } else {
         return `<span>${data}</span>`;
     }
+}
+
+
+// 辅助函数
+function formatFileSize(bytes: number): string {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    // 保留2位小数
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }

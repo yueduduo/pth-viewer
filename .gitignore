@@ -4,3 +4,4 @@ node_modules
 .vscode-test/
 *.vsix
 修改思路.md
+**/__pycache__/

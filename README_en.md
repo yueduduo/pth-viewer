@@ -33,6 +33,10 @@
 * **Tensor Metadata & Value Inspection**
     
     Displays key Tensor metadata (`Shape` and `Dtype`) at a glance. Supports inspecting detailed values, including `min`, `max`, `mean`, and `std` statistics via the "🔍" button.
+  
+* **Efficient Cache Acceleration**
+
+    Built-in data caching mechanism. After the initial parsing of the model file, structural information is automatically cached locally. Subsequent opens achieve instant loading, even for massive weight files several gigabytes in size, completely eliminating the long wait for repeated parsing. 😍
 
 * **Seamless Editor Integration**
     

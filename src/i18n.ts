@@ -19,6 +19,10 @@ const messages = {
         zh: "(自动检测索引)",
         en: "(Auto Index Detection)"
     },
+    btn_reload: {
+        zh: "重新加载",
+        en: "Reload"
+    },
     loading_env_check: {
         zh: "请确保你选择了正确的 Python 环境 (需包含 torch|safetensors|Jax&orbax 库)。",
         en: "Ensure you've selected the correct Python environment (requires torch|safetensors|Jax&orbax)."
@@ -31,6 +35,28 @@ const messages = {
         zh: "正在读取数据...",
         en: "Loading data..."
     },
+    loading_file_size: {
+        zh: "文件大小:",
+        en: "File Size:"
+    },
+
+    loading_failed_overtime: {
+        zh: "加载失败 (超时)",
+        en: "Loading Failed (Timeout)"
+    },
+
+    loading_failed_retry: {
+        zh: "请检查 Python 服务状态或重试。",
+        en: "Check Python server status or retry."
+    },
+
+    loading_server_timeout: {
+        zh: "服务器响应超时。",
+        en: "Server response timeout."
+    },
+
+    
+
 
     // --- 状态栏与控制面板 (Status Bar / Control Panel) ---
     view_global_title: {
