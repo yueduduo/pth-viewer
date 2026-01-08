@@ -668,6 +668,15 @@ export function getWebviewContent(bodyContent: string, webview?: vscode.Webview)
                 border-radius: 4px;
             }
 
+            /* 7. 截断项样式 */
+            .truncated-item {
+                color: var(--vscode-descriptionForeground);
+                font-style: italic; /* 斜体可以进一步增加辨识度，暗示这是辅助信息 */
+                font-size: 0.9em;
+                padding: 2px 0;
+                opacity: 0.8; /* 稍微降低透明度，使其不喧宾夺主 */
+            }
+
             /* inspect 查看数据 新增样式 */
             .inspect-btn {
                 cursor: pointer;
@@ -832,7 +841,15 @@ export function generateJsonHtml(data: any, keyPath: string[] = []): string {
             // === 核心修改：路径追加 (Push) ===
             // 创建新数组，避免污染父级 path
             const currentPath = [...keyPath, index.toString()]; 
-            listItems += `<li><span class="key-name">[${index}]: </span>${generateJsonHtml(item, currentPath)}</li>`;
+            const value = generateJsonHtml(item, currentPath)
+            
+            // 如果 item是string 并且 以__pth__truncated__ 开头以及结尾
+            if (typeof item === 'string' && item.startsWith('__pth__truncated__') && item.endsWith('__pth__truncated__')) {
+                listItems += `<li class="truncated-item"><span>[${index}]: </span>${value}</li>`;
+            } else {
+                listItems += `<li><span class="key-name">[${index}]: </span>${value}</li>`;
+            }
+            
         });
         if (listItems) { childrenHtml = `<ul>${listItems}</ul>`; hasChildren = true; }
     } else if (data.__pth_overview_pth__){
@@ -844,7 +861,16 @@ export function generateJsonHtml(data: any, keyPath: string[] = []): string {
             if (['_type', 'dtype', 'shape', 'location'].includes(key)) continue;
             // === 核心修改：路径追加 (Push) ===
             const currentPath = [...keyPath, key];
-            listItems += `<li><span class="key-name">"${key}": </span>${generateJsonHtml(data[key], currentPath)}</li>`;
+            const value = generateJsonHtml(data[key], currentPath)
+
+            // 对 __pth__truncated__ 开头以及结尾的 key
+            if (key.startsWith('__pth__truncated__') && key.endsWith('__pth__truncated__')) {
+                listItems += `<li class="truncated-item"><span">"${key}": </span>${value}</li>`;
+            } else {
+                listItems += `<li><span class="key-name">"${key}": </span>${value}</li>`;
+            }
+
+            
         }
         if (listItems) { childrenHtml = `<ul>${listItems}</ul>`; hasChildren = true; }
     }

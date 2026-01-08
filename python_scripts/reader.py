@@ -172,11 +172,42 @@ class TorchReader(BaseReader):
             # 其他加载错误，抛出以便上层捕获
             raise e
 
-    def _recursive_summary(self, data):
+    def _recursive_summary(self, data, depth=0):
+        # 针对超大元素数目的文件 增加截断逻辑
+        # 1. 限制递归深度，防止极深嵌套导致栈溢出或 JSON 过大
+        if depth > 20: 
+            return "..."
+        
         if isinstance(data, dict):
-            return {k: self._recursive_summary(v) for k, v in data.items()}
+            # 如果字典太大（比如超过 1000 个键），只显示前 50 个
+            if len(data) > 1000:
+                truncated_dict = {}
+                keys = list(data.keys())
+                # 取前 20 个
+                for k in keys[:20]:
+                    truncated_dict[k] = self._recursive_summary(data[k], depth + 1)
+                
+                # 插入省略提示
+                truncated_dict["__pth__truncated__...__pth__truncated__"] = f"(Total {len(data)} items (including truncated))"
+                
+                # 取后 10 个 (通常看结尾也很重要)
+                for k in keys[-10:]:
+                    truncated_dict[k] = self._recursive_summary(data[k], depth + 1)
+                return truncated_dict
+            
+            # 正常字典
+            return {k: self._recursive_summary(v, depth + 1) for k, v in data.items()}
+        
         elif isinstance(data, (list, tuple)):
-            return [self._recursive_summary(v) for v in data]
+            # 2. 智能截断超长列表
+            # 很多 checkpoint 会保存 layer_wise 的 list，可能长达几千
+            if len(data) > 1000:
+                head = [self._recursive_summary(v, depth + 1) for v in data[:20]]
+                tail = [self._recursive_summary(v, depth + 1) for v in data[-10:]]
+                return head + [f"__pth__truncated__............. (Total {len(data)} items (including truncated)) .............__pth__truncated__"] + tail
+            
+            return [self._recursive_summary(v, depth + 1) for v in data]
+        
         elif torch.is_tensor(data):
             return {
                 "_type": "tensor",
@@ -190,7 +221,7 @@ class TorchReader(BaseReader):
             try:
                 # 将模型对象转换为 state_dict (参数字典)
                 # 这样就能看到 model.0.conv.weight 这样的层级结构了
-                return self._recursive_summary(data.state_dict())
+                return self._recursive_summary(data.state_dict(), 0) # 递归深度重置，因为这是一个新的逻辑层级
             except Exception as e:
                 return f"<Model Object: {str(type(data))} (Error expanding: {e})>"
         # ======================================
@@ -207,7 +238,8 @@ class TorchReader(BaseReader):
 
     def get_structure(self):
         if self.content is None: self.load()
-        return self._recursive_summary(self.content)
+        # 传入初始深度 0
+        return self._recursive_summary(self.content, 0)
 
     def get_tensor_data(self, key_path_json):
         """

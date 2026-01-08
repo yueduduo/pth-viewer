@@ -36,8 +36,8 @@ const messages = {
         en: "Loading data..."
     },
     loading_file_size: {
-        zh: "文件大小:",
-        en: "File Size:"
+        zh: "文件大小",
+        en: "File Size"
     },
 
     loading_failed_overtime: {
