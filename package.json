@@ -2,7 +2,7 @@
   "name": "pth-viewer",
   "displayName": "PyTorch Structure Viewer",
   "description": "Visualize the hierarchical structure (Tensors, Dictionaries) of PyTorch/SafeTensor/Jax .pth .pt .safetensor and .ocdbt files.",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "icon": "assets/icon_pth_viewer.png", 
   "publisher": "pth-viewer",
   

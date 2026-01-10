@@ -4,6 +4,8 @@ import sys
 import threading
 import os
 import urllib.parse
+import signal  # <--- 新增导入
+import platform # <--- 新增导入
 
 # === 导入现有的 Reader 逻辑 ===
 # 请确保 reader.py 在同一目录下
@@ -19,28 +21,61 @@ except ImportError:
 LOADED_MODELS = {} 
 # 自动关闭定时器
 SHUTDOWN_TIMER = None
+
+# 增加线程锁，防止多线程并发请求时，Timer 取消/创建 发生冲突
+TIMER_LOCK = threading.Lock() 
 # 超时时间 (秒): 如果 5 分钟没有任何请求，服务器自动退出
 TIMEOUT_SECONDS = 300 
+# 全局 Server 引用，用于优雅关闭
+SERVER_INSTANCE = None 
 
 def reset_shutdown_timer():
-    """重置自动关闭定时器"""
+    """重置自动关闭定时器 (线程安全版)"""
     global SHUTDOWN_TIMER
-    if SHUTDOWN_TIMER:
-        SHUTDOWN_TIMER.cancel()
     
-    # 只有当没有模型加载时，或者即使有模型也强制倒计时？
-    # 策略：只要有请求就重置。如果前端全都关闭了，会发送 release，
-    # 我们可以选择: 只要有活动连接就不关，或者依靠前端的心跳。
-    # 这里采用简单策略：每次请求都重置倒计时。
-    SHUTDOWN_TIMER = threading.Timer(TIMEOUT_SECONDS, auto_shutdown)
-    SHUTDOWN_TIMER.start()
+    # 加锁，确保同一时间只有一个线程在操作定时器
+    with TIMER_LOCK:
+        if SHUTDOWN_TIMER:
+            try:
+                SHUTDOWN_TIMER.cancel()
+            except:
+                pass
+        
+        # 创建新的定时器
+        SHUTDOWN_TIMER = threading.Timer(TIMEOUT_SECONDS, auto_shutdown)
+        # 设置为守护线程，这样如果主程序退出了，定时器线程也会自动销毁
+        SHUTDOWN_TIMER.daemon = True 
+        SHUTDOWN_TIMER.start()
 
 def auto_shutdown():
-    print("[Server] Timeout reached. Shutting down...", file=sys.stderr)
-    os._exit(0)
+    """超时自动退出"""
+    print(f"[Server] No requests for {TIMEOUT_SECONDS}s. Shutting down...", file=sys.stderr)
+    
+    # 1. 尝试优雅关闭 Server Loop (让 serve_forever 返回)
+    if SERVER_INSTANCE:
+        try:
+            # shutdown() 必须在非主线程调用，这里正好是 Timer 线程，所以是安全的
+            SERVER_INSTANCE.shutdown()
+        except:
+            pass
+
+    # 2. 根据系统执行强制退出
+    system_platform = platform.system()
+    
+    if system_platform == 'Linux' or system_platform == 'Darwin': # Linux 或 Mac
+        try:
+            # === Linux 必杀技 ===
+            # os._exit 可能被阻塞，SIGKILL 是操作系统级别的强制结束
+            os.kill(os.getpid(), signal.SIGKILL)
+        except:
+            os._exit(0)
+    else:
+        # Windows
+        os._exit(0)
 
 class RequestHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
+        # 收到请求，重置倒计时
         reset_shutdown_timer()
         
         # 1. 解析请求路径和 Body
@@ -199,6 +234,9 @@ if __name__ == "__main__":
     # 使用 ThreadingHTTPServer 支持并发 (虽然 JS 端是串行的，但防卡死)
     # Python 3.7+ 支持 ThreadingHTTPServer
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), RequestHandler)
+    
+    # === 将 server 赋值给全局变量，以便在 auto_shutdown 中调用 ===
+    SERVER_INSTANCE = server
     
     # 获取系统分配的随机端口
     port = server.server_address[1]

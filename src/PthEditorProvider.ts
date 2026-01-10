@@ -884,6 +884,21 @@ export function generateJsonHtml(data: any, keyPath: string[] = []): string {
         const summary = Array.isArray(data) ? 'List []' : 'Dict {}';
         return `<details open><summary>${summary}</summary>${childrenHtml}</details>`;
     } else {
+        // === 修复开始：针对空对象/空数组的显示优化 ===
+        // 如果是对象且不为空 (null)，说明它是空字典或空列表
+        if (typeof data === 'object' && data !== null) {
+            // 使用灰色斜体显示，提示用户这是空的
+            const emptyStyle = 'color:var(--vscode-descriptionForeground); font-style:italic;';
+            
+            if (Array.isArray(data)) {
+                 return `<span style="${emptyStyle}">List [] (Empty)</span>`;
+            } else {
+                 return `<span style="${emptyStyle}">Dict {} (Empty)</span>`;
+            }
+        }
+        // === 修复结束 ===
+
+        // 普通基本类型 (数字、字符串等)
         return `<span>${data}</span>`;
     }
 }
