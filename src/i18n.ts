@@ -76,8 +76,8 @@ const messages = {
         en: "Showing current file content only"
     },
     view_single_no_index: {
-        zh: "单文件视图 (未检测到索引)",
-        en: "Single File View (No Index Detected)"
+        zh: "",//"单文件视图 (未检测到索引)",
+        en: "",//"Single File View (No Index Detected)"
     },
     btn_switch_to_single: {
         zh: "切换为只看当前文件",
