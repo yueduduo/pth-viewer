@@ -2,7 +2,7 @@
   "name": "pth-viewer",
   "displayName": "PyTorch Structure Viewer",
   "description": "Visualize the hierarchical structure (Tensors, Dictionaries) of PyTorch/SafeTensor/Jax .pth .pt .safetensor and .ocdbt files.",
-  "version": "0.0.8",
+  "version": "0.0.9",
   "icon": "assets/icon_pth_viewer.png", 
   "publisher": "pth-viewer",
   
@@ -16,7 +16,7 @@
   "homepage": "https://github.com/yueduduo/pth-viewer/blob/main/README.md",
 
   "engines": {
-    "vscode": "^1.106.1"
+    "vscode": "^0.10.5"
   },
   "categories": [
     "Other"
@@ -88,7 +88,7 @@
     "test": "vscode-test"
   },
   "devDependencies": {
-    "@types/vscode": "^1.106.1",
+    "@types/vscode": "^0.10.5",
     "@types/mocha": "^10.0.10",
     "@types/node": "22.x",
     "typescript-eslint": "^8.46.3",

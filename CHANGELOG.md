@@ -62,4 +62,6 @@ Added
 
 * server: 修复linux下的超时无法自动退出问题
 
-  
+## [0.0.9] - 2026-02-24
+
+* engine: 降低对vscode版本的要求，从^1.106.1 改为 ^0.10.5，适应旧版vscode用户以及cursor，trae等用户
