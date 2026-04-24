@@ -4,6 +4,9 @@ import json
 import os
 import argparse
 import math
+import hashlib
+import tempfile
+import large_structure_index
 
 # ==========================================
 # 依赖检测
@@ -160,53 +163,103 @@ class BaseReader:
 
 class TorchReader(BaseReader):
     """专门处理 .pt / .pth"""
+    def __init__(self, file_path):
+        super().__init__(file_path)
+        self.allow_unsafe_load = False
+        self.export_cache_dir = None
+        self.export_cache_key = None
+        self.last_structure_meta = {
+            "truncated": False,
+            "full_structure_path": None,
+            "full_structure_index_path": None,
+        }
+
+    def set_allow_unsafe(self, allow_unsafe):
+        new_value = bool(allow_unsafe)
+        if self.allow_unsafe_load != new_value:
+            self.allow_unsafe_load = new_value
+            # 模式切换后必须让下次读取重新 load，避免复用旧内容
+            self.content = None
+
+    def set_export_cache_dir(self, cache_dir):
+        if cache_dir and isinstance(cache_dir, str):
+            self.export_cache_dir = cache_dir
+
+    def set_export_cache_key(self, cache_key):
+        if cache_key and isinstance(cache_key, str):
+            self.export_cache_key = cache_key
+
+    def _compute_export_key(self):
+        if self.export_cache_key and isinstance(self.export_cache_key, str):
+            return self.export_cache_key
+        stats = os.stat(self.file_path)
+        base_key = f"{self.file_path}|{stats.st_mtime_ns}|{stats.st_size}|{self.allow_unsafe_load}"
+        return hashlib.md5(base_key.encode("utf-8")).hexdigest()
+
     def load(self):
         # map_location='cpu' 防止无 GPU 报错
+        if self.allow_unsafe_load:
+            try:
+                # 用户显式信任文件后，启用不安全加载
+                self.content = torch.load(self.file_path, map_location='cpu', weights_only=False)
+            except TypeError:
+                self.content = torch.load(self.file_path, map_location='cpu')
+            except Exception as e:
+                raise e
+            return
+
         try:
-            # 针对 PyTorch 2.4+ / 2.6+，显式允许加载完整对象
-            self.content = torch.load(self.file_path, map_location='cpu', weights_only=False)
+            # 默认优先安全模式
+            self.content = torch.load(self.file_path, map_location='cpu', weights_only=True)
         except TypeError:
-            # 针对旧版本 PyTorch (不支持 weights_only 参数)，直接加载
-            self.content = torch.load(self.file_path, map_location='cpu')
+            raise RuntimeError(
+                "Current PyTorch does not support weights_only. "
+                "Enable unsafe load for trusted files, or upgrade PyTorch."
+            )
         except Exception as e:
-            # 其他加载错误，抛出以便上层捕获
             raise e
 
-    def _recursive_summary(self, data, depth=0):
+    def _recursive_summary(self, data, depth=0, apply_truncation=True, stats=None):
+        if stats is None:
+            stats = {"truncated": False}
+
         # 针对超大元素数目的文件 增加截断逻辑
         # 1. 限制递归深度，防止极深嵌套导致栈溢出或 JSON 过大
-        if depth > 20: 
+        if apply_truncation and depth > 20:
+            stats["truncated"] = True
             return "..."
         
         if isinstance(data, dict):
             # 如果字典太大（比如超过 1000 个键），只显示前 50 个
-            if len(data) > 1000:
+            if apply_truncation and len(data) > 1000:
+                stats["truncated"] = True
                 truncated_dict = {}
                 keys = list(data.keys())
                 # 取前 20 个
                 for k in keys[:20]:
-                    truncated_dict[k] = self._recursive_summary(data[k], depth + 1)
+                    truncated_dict[k] = self._recursive_summary(data[k], depth + 1, apply_truncation, stats)
                 
                 # 插入省略提示
                 truncated_dict["__pth__truncated__...__pth__truncated__"] = f"(Total {len(data)} items (including truncated))"
                 
                 # 取后 10 个 (通常看结尾也很重要)
                 for k in keys[-10:]:
-                    truncated_dict[k] = self._recursive_summary(data[k], depth + 1)
+                    truncated_dict[k] = self._recursive_summary(data[k], depth + 1, apply_truncation, stats)
                 return truncated_dict
             
             # 正常字典
-            return {k: self._recursive_summary(v, depth + 1) for k, v in data.items()}
+            return {k: self._recursive_summary(v, depth + 1, apply_truncation, stats) for k, v in data.items()}
         
         elif isinstance(data, (list, tuple)):
             # 2. 智能截断超长列表
             # 很多 checkpoint 会保存 layer_wise 的 list，可能长达几千
-            if len(data) > 1000:
-                head = [self._recursive_summary(v, depth + 1) for v in data[:20]]
-                tail = [self._recursive_summary(v, depth + 1) for v in data[-10:]]
+            if apply_truncation and len(data) > 1000:
+                stats["truncated"] = True
+                head = [self._recursive_summary(v, depth + 1, apply_truncation, stats) for v in data[:20]]
+                tail = [self._recursive_summary(v, depth + 1, apply_truncation, stats) for v in data[-10:]]
                 return head + [f"__pth__truncated__............. (Total {len(data)} items (including truncated)) .............__pth__truncated__"] + tail
             
-            return [self._recursive_summary(v, depth + 1) for v in data]
+            return [self._recursive_summary(v, depth + 1, apply_truncation, stats) for v in data]
         
         elif torch.is_tensor(data):
             return {
@@ -221,7 +274,7 @@ class TorchReader(BaseReader):
             try:
                 # 将模型对象转换为 state_dict (参数字典)
                 # 这样就能看到 model.0.conv.weight 这样的层级结构了
-                return self._recursive_summary(data.state_dict(), 0) # 递归深度重置，因为这是一个新的逻辑层级
+                return self._recursive_summary(data.state_dict(), 0, apply_truncation, stats) # 递归深度重置，因为这是一个新的逻辑层级
             except Exception as e:
                 return f"<Model Object: {str(type(data))} (Error expanding: {e})>"
         # ======================================
@@ -236,10 +289,65 @@ class TorchReader(BaseReader):
         else:
             return str(type(data))
 
-    def get_structure(self):
+    def _build_full_structure_export_path(self):
+        key_hash = self._compute_export_key()
+        export_dir = self.export_cache_dir if self.export_cache_dir else os.path.join(tempfile.gettempdir(), "pth_viewer_full_structures")
+        os.makedirs(export_dir, exist_ok=True)
+        return os.path.join(export_dir, f"{key_hash}.full-structure.json")
+
+    def _build_full_structure_index_path(self):
+        key_hash = self._compute_export_key()
+        export_dir = self.export_cache_dir if self.export_cache_dir else os.path.join(tempfile.gettempdir(), "pth_viewer_full_structures")
+        os.makedirs(export_dir, exist_ok=True)
+        return os.path.join(export_dir, f"{key_hash}.full-structure.sqlite")
+
+    def get_last_structure_meta(self):
+        return self.last_structure_meta
+
+    def get_structure(self, export_full_artifacts=True):
         if self.content is None: self.load()
-        # 传入初始深度 0
-        return self._recursive_summary(self.content, 0)
+        prev_full_structure_path = self.last_structure_meta.get("full_structure_path")
+        prev_full_structure_index_path = self.last_structure_meta.get("full_structure_index_path")
+        prev_export_error = self.last_structure_meta.get("full_structure_export_error")
+        self.last_structure_meta = {
+            "truncated": False,
+            "full_structure_path": None,
+            "full_structure_index_path": None,
+        }
+
+        truncate_stats = {"truncated": False}
+        structure = self._recursive_summary(self.content, 0, True, truncate_stats)
+        if not export_full_artifacts:
+            self.last_structure_meta = {
+                "truncated": bool(truncate_stats["truncated"]),
+                "full_structure_path": prev_full_structure_path,
+                "full_structure_index_path": prev_full_structure_index_path,
+            }
+            if prev_export_error:
+                self.last_structure_meta["full_structure_export_error"] = prev_export_error
+            return structure
+
+        full_structure = structure if not truncate_stats["truncated"] else self._recursive_summary(self.content, 0, False, {"truncated": False})
+        export_path = self._build_full_structure_export_path()
+        index_path = self._build_full_structure_index_path()
+        try:
+            with open(export_path, "w", encoding="utf-8") as f:
+                json.dump(full_structure, f, ensure_ascii=False, indent=2)
+            large_structure_index.build_index(index_path, full_structure)
+            self.last_structure_meta = {
+                "truncated": bool(truncate_stats["truncated"]),
+                "full_structure_path": export_path,
+                "full_structure_index_path": index_path,
+            }
+        except Exception as e:
+            self.last_structure_meta = {
+                "truncated": bool(truncate_stats["truncated"]),
+                "full_structure_path": None,
+                "full_structure_index_path": None,
+                "full_structure_export_error": str(e),
+            }
+
+        return structure
 
     def get_tensor_data(self, key_path_json):
         """

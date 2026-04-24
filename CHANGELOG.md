@@ -65,3 +65,14 @@ Added
 ## [0.0.9] - 2026-02-24
 
 * engine: 降低对vscode版本的要求，从^1.106.1 改为 ^0.10.5，适应旧版vscode用户以及cursor，trae等用户
+
+## [0.0.10] - 2026-04-24
+
+* fix: 修复 Cursor 商店安装阶段卡在 Installing 的兼容性问题，恢复为^1.46.0（VS Code Custom Editor API 稳定版本），移除对 ms-python.python 的硬依赖，改为运行时可选检测。
+
+
+## [0.0.11] - 2026-04-25
+
+* ui: 美化树形结构和inspect，增加对截断数据的可视化
+* ui: 增加find, collapse，json按钮
+* server: 修复多文件并发争夺，增加sqlite对截断数据的保存

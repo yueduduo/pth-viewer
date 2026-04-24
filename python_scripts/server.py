@@ -6,15 +6,18 @@ import os
 import urllib.parse
 import signal  # <--- 新增导入
 import platform # <--- 新增导入
+import re
 
 # === 导入现有的 Reader 逻辑 ===
 # 请确保 reader.py 在同一目录下
 try:
     import reader
+    import large_structure_index
 except ImportError:
     # 如果找不到，尝试添加当前路径
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     import reader
+    import large_structure_index
 
 # === 全局状态 ===
 # 缓存已加载的 Reader 对象: { "file_path_str": reader_instance }
@@ -28,6 +31,173 @@ TIMER_LOCK = threading.Lock()
 TIMEOUT_SECONDS = 300 
 # 全局 Server 引用，用于优雅关闭
 SERVER_INSTANCE = None 
+
+def _normalize_file_path(file_path):
+    if not file_path or not isinstance(file_path, str):
+        return file_path
+    return os.path.normcase(os.path.normpath(os.path.abspath(file_path)))
+
+def _fallback_export_paths(file_path, cache_dir, cache_key=None):
+    if not cache_dir:
+        return None, None
+    os.makedirs(cache_dir, exist_ok=True)
+    key_hash = cache_key
+    if not key_hash:
+        stats = os.stat(file_path)
+        key_seed = f"{file_path}|{stats.st_mtime_ns}|{stats.st_size}|fallback"
+        import hashlib
+        key_hash = hashlib.md5(key_seed.encode("utf-8")).hexdigest()
+    return (
+        os.path.join(cache_dir, f"{key_hash}.full-structure.json"),
+        os.path.join(cache_dir, f"{key_hash}.full-structure.sqlite"),
+    )
+
+def _ensure_structure_export_if_missing(file_path, structure, cache_dir, cache_key=None, existing_json_path=None, existing_index_path=None):
+    full_json = existing_json_path
+    full_index = existing_index_path
+    export_error = None
+
+    if full_json and full_index and os.path.exists(full_json) and os.path.exists(full_index):
+        return full_json, full_index, export_error
+
+    export_json_path, export_index_path = _fallback_export_paths(file_path, cache_dir, cache_key)
+    if not export_json_path or not export_index_path:
+        return full_json, full_index, export_error
+
+    try:
+        with open(export_json_path, "w", encoding="utf-8") as f:
+            json.dump(structure, f, ensure_ascii=False, indent=2)
+        large_structure_index.build_index(export_index_path, structure)
+        return export_json_path, export_index_path, None
+    except Exception as e:
+        export_error = str(e)
+        return full_json, full_index, export_error
+
+
+def _parse_display_path(display_path):
+    if not display_path or display_path == "$":
+        return []
+    p = display_path
+    if p.startswith("$."):
+        p = p[2:]
+    elif p.startswith("$"):
+        p = p[1:]
+    tokens = []
+    for m in re.finditer(r'([^\.\[\]]+)|\[(\d+)\]', p):
+        if m.group(1) is not None:
+            tokens.append(m.group(1))
+        elif m.group(2) is not None:
+            tokens.append(m.group(2))
+    return tokens
+
+
+def _resolve_node_by_path(root, display_path):
+    tokens = _parse_display_path(display_path)
+    node = root
+    for t in tokens:
+        if isinstance(node, list):
+            idx = int(t)
+            if idx < 0 or idx >= len(node):
+                return None
+            node = node[idx]
+        elif isinstance(node, dict):
+            if t not in node:
+                return None
+            node = node[t]
+        else:
+            return None
+    return node
+
+
+def _node_type_and_expandable(node):
+    if isinstance(node, dict) and node.get("_type") in ("tensor", "tensor_ref"):
+        return node.get("_type"), False
+    if isinstance(node, dict):
+        return "object", True
+    if isinstance(node, list):
+        return "array", True
+    return "scalar", False
+
+
+def _node_summary(node, node_type):
+    if node_type == "object":
+        return f"Dict {{{len(node)}}}"
+    if node_type == "array":
+        return f"List [{len(node)}]"
+    if node_type in ("tensor", "tensor_ref") and isinstance(node, dict):
+        dtype = node.get("dtype", "?")
+        shape = node.get("shape", [])
+        return f"{node_type} shape={shape} dtype={dtype}"
+    text = str(node)
+    if len(text) > 200:
+        return text[:200] + "..."
+    return text
+
+
+def _dynamic_children(node, display_path, offset, limit):
+    node_type, expandable = _node_type_and_expandable(node)
+    if not expandable:
+        return {
+            "current": {
+                "id": display_path,
+                "parent_id": None,
+                "key": display_path,
+                "display_path": display_path,
+                "node_type": node_type,
+                "is_expandable": False,
+                "summary": _node_summary(node, node_type),
+                "dtype": node.get("dtype") if isinstance(node, dict) else None,
+                "shape": node.get("shape") if isinstance(node, dict) else None,
+            },
+            "children": [],
+            "offset": offset,
+            "limit": limit,
+            "total_children": 0,
+        }
+
+    if isinstance(node, dict):
+        items = list(node.items())
+    else:
+        items = [(str(i), v) for i, v in enumerate(node)]
+
+    total = len(items)
+    page_items = items[offset:offset + limit]
+    children = []
+    for key, child in page_items:
+        child_type, child_expandable = _node_type_and_expandable(child)
+        if display_path == "$":
+            child_display_path = key if isinstance(node, dict) else f"[{key}]"
+        else:
+            child_display_path = f"{display_path}.{key}" if isinstance(node, dict) else f"{display_path}[{key}]"
+        children.append({
+            "id": child_display_path,
+            "parent_id": display_path,
+            "key": key,
+            "display_path": child_display_path,
+            "node_type": child_type,
+            "is_expandable": child_expandable,
+            "summary": _node_summary(child, child_type),
+            "dtype": child.get("dtype") if isinstance(child, dict) else None,
+            "shape": child.get("shape") if isinstance(child, dict) else None,
+        })
+
+    return {
+        "current": {
+            "id": display_path,
+            "parent_id": None,
+            "key": display_path,
+            "display_path": display_path,
+            "node_type": node_type,
+            "is_expandable": True,
+            "summary": _node_summary(node, node_type),
+            "dtype": node.get("dtype") if isinstance(node, dict) else None,
+            "shape": node.get("shape") if isinstance(node, dict) else None,
+        },
+        "children": children,
+        "offset": offset,
+        "limit": limit,
+        "total_children": total,
+    }
 
 def reset_shutdown_timer():
     """重置自动关闭定时器 (线程安全版)"""
@@ -96,17 +266,33 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         try:
             # === API: /load (加载或获取结构) ===
             if parsed_path.path == '/load':
-                file_path = payload.get('file_path')
+                file_path = _normalize_file_path(payload.get('file_path'))
                 force_local = payload.get('force_local', False)
+                allow_unsafe = payload.get('allow_unsafe', False)
+                cache_dir = payload.get('cache_dir')
+                cache_key = payload.get('cache_key')
+                if not file_path:
+                    response_data = {"error": "Missing file_path"}
+                    self._send_json(response_data, status_code)
+                    return
                 
                 # 如果已经在内存里，直接用；否则新建
                 if file_path not in LOADED_MODELS:
                     # 使用 ReaderFactory (需要修改 reader.py 暴露它，或者直接实例化)
                     # 假设 reader.py 里有 ReaderFactory
                     r = reader.ReaderFactory.get_reader(file_path)
+                    if hasattr(r, "set_allow_unsafe"):
+                        r.set_allow_unsafe(allow_unsafe)
+                    if hasattr(r, "set_export_cache_dir"):
+                        r.set_export_cache_dir(cache_dir)
+                    if hasattr(r, "set_export_cache_key"):
+                        r.set_export_cache_key(cache_key)
                     
-                    #调用 get_structure 触发加载并缓存
-                    structure = r.get_structure() 
+                    # 首次加载到内存：允许导出 full json/sqlite
+                    if isinstance(r, reader.TorchReader):
+                        structure = r.get_structure(export_full_artifacts=True)
+                    else:
+                        structure = r.get_structure()
                     
                     # 存入缓存
                     LOADED_MODELS[file_path] = r
@@ -114,6 +300,27 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     # 检查是否有全局索引 (这里复用 reader.py 的逻辑)
                     # 简单起见，我们假设 reader.get_structure() 返回的就是标准结构
                     response_data = {"is_global": False, "data": structure}
+                    response_data["source_file_path"] = file_path
+                    full_json_path = None
+                    full_index_path = None
+                    export_error = None
+                    if hasattr(r, "get_last_structure_meta"):
+                        structure_meta = r.get_last_structure_meta()
+                        if structure_meta.get("truncated"):
+                            response_data["truncated"] = True
+                        full_json_path = structure_meta.get("full_structure_path")
+                        full_index_path = structure_meta.get("full_structure_index_path")
+                        if structure_meta.get("full_structure_export_error"):
+                            export_error = structure_meta.get("full_structure_export_error")
+                    full_json_path, full_index_path, fallback_err = _ensure_structure_export_if_missing(
+                        file_path, structure, cache_dir, cache_key, full_json_path, full_index_path
+                    )
+                    if fallback_err:
+                        export_error = fallback_err
+                    response_data["full_structure_path"] = full_json_path
+                    response_data["full_structure_index_path"] = full_index_path
+                    if export_error:
+                        response_data["full_structure_export_error"] = export_error
                     
                     # 尝试检测全局索引 (复用 reader.py 的逻辑片段)
                     if not force_local and not isinstance(r, reader.JaxReader):
@@ -123,18 +330,125 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                         for idx in possible:
                             if os.path.exists(os.path.join(dir_name, idx)):
                                 idx_res = reader.read_global_index(os.path.join(dir_name, idx), base_name)
+                                idx_res["full_structure_path"] = full_json_path
+                                idx_res["full_structure_index_path"] = full_index_path
+                                idx_res["source_file_path"] = file_path
+                                if export_error:
+                                    idx_res["full_structure_export_error"] = export_error
                                 response_data = idx_res
                                 break
                 else:
                     # 已存在缓存中，直接获取结构
                     # 注意：如果是大模型，get_structure 应该是极快的（因为 content 已在内存）
                     r = LOADED_MODELS[file_path]
-                    response_data = {"is_global": False, "data": r.get_structure()}
+                    if hasattr(r, "set_allow_unsafe"):
+                        r.set_allow_unsafe(allow_unsafe)
+                    if hasattr(r, "set_export_cache_dir"):
+                        r.set_export_cache_dir(cache_dir)
+                    if hasattr(r, "set_export_cache_key"):
+                        r.set_export_cache_key(cache_key)
+                    # 非首次加载：只读内存结构，不再写 full json/sqlite
+                    if isinstance(r, reader.TorchReader):
+                        structure = r.get_structure(export_full_artifacts=False)
+                    else:
+                        structure = r.get_structure()
+                    response_data = {"is_global": False, "data": structure}
+                    response_data["source_file_path"] = file_path
+                    full_json_path = None
+                    full_index_path = None
+                    export_error = None
+                    if hasattr(r, "get_last_structure_meta"):
+                        structure_meta = r.get_last_structure_meta()
+                        if structure_meta.get("truncated"):
+                            response_data["truncated"] = True
+                        full_json_path = structure_meta.get("full_structure_path")
+                        full_index_path = structure_meta.get("full_structure_index_path")
+                        if structure_meta.get("full_structure_export_error"):
+                            export_error = structure_meta.get("full_structure_export_error")
+                    response_data["full_structure_path"] = full_json_path
+                    response_data["full_structure_index_path"] = full_index_path
+                    if export_error:
+                        response_data["full_structure_export_error"] = export_error
+
+            elif parsed_path.path == '/tree_children':
+                index_db_path = payload.get('index_db_path')
+                node_id = int(payload.get('node_id', 1))
+                offset = int(payload.get('offset', 0))
+                limit = int(payload.get('limit', 200))
+                response_data = large_structure_index.get_children(index_db_path, node_id, offset, limit)
+
+            elif parsed_path.path == '/tree_search':
+                index_db_path = payload.get('index_db_path')
+                query = payload.get('query', '')
+                limit = int(payload.get('limit', 50))
+                response_data = large_structure_index.search_nodes(index_db_path, query, limit)
+
+            elif parsed_path.path == '/tree_children_by_path':
+                index_db_path = payload.get('index_db_path')
+                display_path = payload.get('display_path', '$')
+                offset = int(payload.get('offset', 0))
+                limit = int(payload.get('limit', 200))
+                response_data = large_structure_index.get_children_by_path(index_db_path, display_path, offset, limit)
+
+            elif parsed_path.path == '/model_status':
+                file_path = _normalize_file_path(payload.get('file_path'))
+                response_data = {
+                    "loaded_in_memory": bool(file_path and file_path in LOADED_MODELS)
+                }
+
+            elif parsed_path.path == '/tree_children_dynamic':
+                file_path = _normalize_file_path(payload.get('file_path'))
+                display_path = payload.get('display_path', '$')
+                offset = int(payload.get('offset', 0))
+                limit = int(payload.get('limit', 200))
+                allow_unsafe = payload.get('allow_unsafe', False)
+                if not file_path:
+                    response_data = {"error": "Missing file_path in dynamic tree request"}
+                    self._send_json(response_data, status_code)
+                    return
+                reloaded_from_disk = False
+                r = LOADED_MODELS.get(file_path)
+                if r is None:
+                    reloaded_from_disk = True
+                    r = reader.ReaderFactory.get_reader(file_path)
+                    if hasattr(r, "set_allow_unsafe"):
+                        r.set_allow_unsafe(allow_unsafe)
+                    try:
+                        r.load()
+                    except Exception as e:
+                        response_data = {"error": str(e), "reloaded_from_disk": True}
+                        self._send_json(response_data, status_code)
+                        return
+                    LOADED_MODELS[file_path] = r
+                else:
+                    if hasattr(r, "set_allow_unsafe"):
+                        r.set_allow_unsafe(allow_unsafe)
+                root_obj = getattr(r, 'content', None)
+                if root_obj is None:
+                    response_data = {"error": f"Model content is empty: {file_path}", "reloaded_from_disk": reloaded_from_disk}
+                else:
+                    target = _resolve_node_by_path(root_obj, display_path)
+                    if target is None:
+                        response_data = {"error": f"Path not found: {display_path}", "reloaded_from_disk": reloaded_from_disk}
+                    else:
+                        response_data = _dynamic_children(target, display_path, offset, limit)
+                        response_data["reloaded_from_disk"] = reloaded_from_disk
+
+            elif parsed_path.path == '/tree_node':
+                index_db_path = payload.get('index_db_path')
+                node_id = int(payload.get('node_id', 1))
+                response_data = large_structure_index.get_node(index_db_path, node_id)
 
             # === API: /inspect (查看数据) ===
             elif parsed_path.path == '/inspect':
-                file_path = payload.get('file_path')
+                file_path = _normalize_file_path(payload.get('file_path'))
                 key_json = payload.get('key') # String format of JSON list
+                allow_unsafe = payload.get('allow_unsafe', False)
+                reloaded_from_disk = False
+                if not file_path:
+                    response_data = {"error": "Missing file_path"}
+                    self._send_json(response_data, status_code)
+                    return
                 
                 # 1. 检查是否在内存中
                 r = LOADED_MODELS.get(file_path)
@@ -145,26 +459,32 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                         print(f"[Server] Model not found in cache, auto-reloading: {file_path}", file=sys.stderr)
                         # 复用 ReaderFactory 创建实例
                         r = reader.ReaderFactory.get_reader(file_path)
-                        # 调用 get_structure 触发底层的 self.load()
-                        # (对于 Safetensors/Jax 等需要显式 open 的 Reader 很重要)
-                        r.get_structure() 
+                        if hasattr(r, "set_allow_unsafe"):
+                            r.set_allow_unsafe(allow_unsafe)
+                        # 仅重载到内存，不触发结构导出
+                        r.load()
                         # 存入全局缓存
                         LOADED_MODELS[file_path] = r
+                        reloaded_from_disk = True
                     except Exception as e:
                         # 重载失败，这才是真正的错误
-                        response_data = {"error": f"Model not loaded and auto-reload failed: {str(e)}"}
+                        response_data = {"error": f"Model not loaded and auto-reload failed: {str(e)}", "reloaded_from_disk": True}
                         r = None # 确保后面不会执行
                 
                 # 3. 如果成功获取到了 Reader (无论是缓存的还是重载的)，执行查询
                 if r is not None:
                     try:
+                        if hasattr(r, "set_allow_unsafe"):
+                            r.set_allow_unsafe(allow_unsafe)
                         response_data = r.get_tensor_data(key_json)
+                        if isinstance(response_data, dict):
+                            response_data["reloaded_from_disk"] = reloaded_from_disk
                     except Exception as e:
-                        response_data = {"error": f"Inspect failed: {str(e)}"}
+                        response_data = {"error": f"Inspect failed: {str(e)}", "reloaded_from_disk": reloaded_from_disk}
 
             # === API: /release (释放内存) ===
             elif parsed_path.path == '/release':
-                file_path = payload.get('file_path')
+                file_path = _normalize_file_path(payload.get('file_path'))
                 if file_path in LOADED_MODELS:
                     del LOADED_MODELS[file_path]
                     # 1. Python 层垃圾回收

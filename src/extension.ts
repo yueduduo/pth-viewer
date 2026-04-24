@@ -15,7 +15,10 @@ export async function activate(context: vscode.ExtensionContext) {
             PthEditorProvider.viewType, // 在 package.json 中定义的 viewType: 'pth-viewer.pthEditor'
             new PthEditorProvider(context),
             {
-                webviewOptions: { retainContextWhenHidden: true } // 隐藏后保留状态，提升性能
+                webviewOptions: {
+                    retainContextWhenHidden: true,
+                    enableFindWidget: true,
+                } // 隐藏后保留状态，提升性能 + 使用原生查找面板
             }
         )
     );
@@ -38,6 +41,12 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // 3. 注册一个命令，用于打开官方 Python 扩展的解释器选择菜单
     let selectPythonCommand = vscode.commands.registerCommand('pth-viewer.selectPython', async () => {
+        const pythonExtension = vscode.extensions.getExtension('ms-python.python');
+        if (!pythonExtension) {
+            vscode.window.showWarningMessage(t('python_extension_missing'));
+            return;
+        }
+
         // 调用官方 Python 插件的命令
         await vscode.commands.executeCommand('python.setInterpreter');
     });

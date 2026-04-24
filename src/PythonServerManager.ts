@@ -21,7 +21,6 @@ export class PythonServerManager {
     
     // 状态标志
     private isStarting: boolean = false;
-    private isProcessingQueue: boolean = false;
     
     // 1. 维护当前使用的 Python 解释器路径
     private currentPythonPath: string | null = null;
@@ -29,8 +28,10 @@ export class PythonServerManager {
     // 2. 环境切换的挂起状态
     private pendingPythonPath: string | null = null;
 
-    // 3. 请求队列
-    private requestQueue: QueueTask[] = [];
+    // 3. 每个文件独立的任务队列尾指针
+    private fileQueueTails: Map<string, Promise<void>> = new Map();
+    // 已入队(含等待中+执行中)任务数，用于环境切换阻塞判断
+    private scheduledTaskCount: number = 0;
 
     // 记录正在进行的 Load 任务 (Promise 复用) 
     // Key: filePath, Value: 该load任务的 Promise
@@ -68,8 +69,8 @@ export class PythonServerManager {
 
         console.log(`[Manager] Environment switched to: ${newPath}`);
 
-        // 如果当前正在处理队列，不要立即杀死进程，而是挂起切换请求
-        if (this.isProcessingQueue || this.requestQueue.length > 0) {
+        // 如果当前仍有任务在执行/排队，不要立即切换环境
+        if (this.scheduledTaskCount > 0) {
             this.pendingPythonPath = newPath;
         } else {
             // 空闲状态，立即重启
@@ -95,7 +96,8 @@ export class PythonServerManager {
         this.isStarting = false;
         // 清空所有状态
         this.loadingPromises.clear();
-        this.requestQueue = [];
+        this.fileQueueTails.clear();
+        this.scheduledTaskCount = 0;
 
         // === 核心修改：移除 ensureServerStarted() ===
         // 只有当 PthEditorProvider 发起 sendRequest 时，才会去启动它
@@ -186,7 +188,8 @@ export class PythonServerManager {
                 this.port = null;
                 this.isStarting = false;
                 this.loadingPromises.clear(); // 进程挂了，所有 Promise 作废
-                this.requestQueue = [];
+                this.fileQueueTails.clear();
+                this.scheduledTaskCount = 0;
 
                 // 关键逻辑：如果 Promise 还没 resolve (端口没拿到) 就退出了
                 // 说明是启动失败（缺库、语法错误等）
@@ -210,7 +213,7 @@ export class PythonServerManager {
      */
     public async sendRequest(endpoint: string, payload: any): Promise<any> {
 
-        const filePath = payload.file_path || ""; // 这里对大文件的safetensor 是否进行 全局加载 没有作处理，因为safetensor其实加载飞快
+        const filePath = this.resolveQueueFilePath(endpoint, payload);
         // 1. 资源 Key: 仅用于识别文件 (用于 Release 匹配)
         const resourceKey = this.getFileKey(filePath); 
         
@@ -226,17 +229,7 @@ export class PythonServerManager {
         // 场景 A: 收到 Load 请求 (打开文件)
         // ---------------------------------------------------------
         if (endpoint === '/load') {
-            // 1. 【队列优化】使用 resourceKey 检查队列
-            // 不管是 Global 还是 Local 模式，只要是针对同一个文件，
-            // 此时如果队列里有 "Release" 任务，说明用户想重新load这个文件，那就取消释放！
-            const releaseTaskIndex = this.requestQueue.findIndex(t => t.type === 'release' && t.fileKey === resourceKey);
-            if (releaseTaskIndex !== -1) {
-                console.log(`[Manager] Optimization: Cancelled pending release for ${path.basename(filePath)}`);
-                // 从队列中移除该 release 任务
-                this.requestQueue.splice(releaseTaskIndex, 1);
-            }
-
-            // 2. 【Promise 复用】使用包含 force_local 的 requestKey 进行检查
+            // Promise 复用：同一路径同一模式并发请求直接复用
             // 只有 路径 和 模式 都完全一样，才直接复用
             if (this.loadingPromises.has(requestKey)) {
                 console.log(`[Manager] Optimization: Join existing load for ${path.basename(filePath)} (Mode: ${payload.force_local})`);
@@ -244,44 +237,14 @@ export class PythonServerManager {
             }
         }
 
-         // ---------------------------------------------------------
-        // 场景 B: 收到 Release 请求 (关闭文件)
-        // ---------------------------------------------------------
-        if (endpoint === '/release') {
-            // 如果当前文件正在加载中 (Promise 还没 resolve)
-            // 我们不能简单地不发送 release，因为如果用户真的关了，还是得释放
-            // 但放入队列是安全的，配合上面的 "Load 逻辑"，如果用户秒开，这个 release 会被上面的逻辑删掉
-        }
-
-        // ---------------------------------------------------------
-        // 构造任务、入队、触发队列处理
-        // ---------------------------------------------------------
-        const taskPromise = new Promise((resolve, reject) => {
-            const taskObj: QueueTask = {
-                type: endpoint === '/load' ? 'load' : (endpoint === '/release' ? 'release' : 'other'),
-                // 注意：队列任务的 fileKey 我们依然使用 resourceKey，
-                // 这样未来的 Release 请求可以找到并匹配它（虽然后面 Release 逻辑目前比较简单）
-                fileKey: resourceKey, 
-                run: async () => {
-                    try {
-                        console.log(`[Manager] Processing ${endpoint} for ${path.basename(filePath)} using Python: ${this.currentPythonPath}`);
-                        const port = await this.ensureServerStarted();
-                        const result = await this.doHttpRequest(port, endpoint, payload);
-                        resolve(result);
-                    } catch (error) {
-                        reject(error);
-                    } finally {
-                        // 任务结束，如果是 load，从 loadingPromises 移除
-                        // 必须移除对应的 requestKey
-                        if (endpoint === '/load') {
-                            this.loadingPromises.delete(requestKey);
-                        }
-                    }
-                }
-            };
-
-            this.requestQueue.push(taskObj);
-            this.processQueue();
+        const taskPromise = this.enqueueFileTask(resourceKey, async () => {
+            console.log(`[Manager] Processing ${endpoint} for ${path.basename(filePath)} using Python: ${this.currentPythonPath}`);
+            const port = await this.ensureServerStarted();
+            return this.doHttpRequest(port, endpoint, payload);
+        }).finally(() => {
+            if (endpoint === '/load') {
+                this.loadingPromises.delete(requestKey);
+            }
         });
 
         // 如果是 Load 任务，记录到 Map 中供后续复用 (使用 requestKey)
@@ -294,30 +257,64 @@ export class PythonServerManager {
     }
 
     /**
-     * 队列处理器 (核心逻辑：串行执行 + 阻塞环境切换)
+     * 统一解析“该请求属于哪个文件队列”
+     * 目标：首次加载/放大镜/动态树加载都落在同一 file queue。
      */
-    private async processQueue() {
-        if (this.isProcessingQueue) return; // 已经在跑了
-        this.isProcessingQueue = true;
-
-        while (this.requestQueue.length > 0) {
-            const task = this.requestQueue.shift(); // 取出第一个任务
-            if (task) {
-                try {
-                    await task.run(); // 等待任务完成
-                } catch (e) {
-                    console.error("[Manager] Task failed:", e);
-                }
+    private resolveQueueFilePath(endpoint: string, payload: any): string {
+        if (!payload || typeof payload !== 'object') {
+            return '__global__';
+        }
+        // sqlite 只读查询必须独立于文件加载队列，避免被 /load 卡住
+        const sqliteEndpoints = new Set(['/tree_children_by_path', '/tree_children', '/tree_search', '/tree_node']);
+        if (sqliteEndpoints.has(endpoint)) {
+            const sqlitePath = payload.index_db_path;
+            if (typeof sqlitePath === 'string' && sqlitePath.trim().length > 0) {
+                return `__sqlite__:${sqlitePath}`;
             }
+            return '__sqlite__';
         }
-        this.isProcessingQueue = false;
+        const directPath =
+            payload.file_path ||
+            payload.source_file_path ||
+            payload.filePath ||
+            payload.sourceFilePath;
+        if (typeof directPath === 'string' && directPath.trim().length > 0) {
+            return directPath;
+        }
+        return '__global__';
+    }
 
-        // 队列处理完了，检查是否有挂起的时间切换请求
-        if (this.pendingPythonPath) {
-            const nextPath = this.pendingPythonPath;
-            this.pendingPythonPath = null; // 立即置空，防止递归逻辑错误
-            await this.restartServer(nextPath);
-        }
+    /**
+     * 每个文件独立队列：同文件串行，不同文件可并行
+     */
+    private enqueueFileTask<T>(fileKey: string, task: () => Promise<T>): Promise<T> {
+        const previousTail = this.fileQueueTails.get(fileKey) ?? Promise.resolve();
+        this.scheduledTaskCount++;
+
+        const runPromise = previousTail
+            .catch(() => undefined)
+            .then(async () => {
+                try {
+                    return await task();
+                } finally {
+                    this.scheduledTaskCount--;
+                    if (this.scheduledTaskCount === 0 && this.pendingPythonPath) {
+                        const nextPath = this.pendingPythonPath;
+                        this.pendingPythonPath = null;
+                        await this.restartServer(nextPath);
+                    }
+                }
+            });
+
+        const newTail = runPromise.then(() => undefined, () => undefined);
+        this.fileQueueTails.set(fileKey, newTail);
+        newTail.finally(() => {
+            if (this.fileQueueTails.get(fileKey) === newTail) {
+                this.fileQueueTails.delete(fileKey);
+            }
+        });
+
+        return runPromise;
     }
 
     /**
@@ -368,6 +365,7 @@ export class PythonServerManager {
      * 辅助方法：标准化文件路径 (统一大小写和斜杠，作为 Map 的 Key)
      */
     private getFileKey(filePath: string): string {
+        if (!filePath) return '__global__';
         return path.normalize(filePath).toLowerCase(); // Windows 不区分大小写
     }
 }

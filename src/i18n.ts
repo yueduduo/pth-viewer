@@ -20,8 +20,16 @@ const messages = {
         en: "(Auto Index Detection)"
     },
     btn_reload: {
-        zh: "重新加载",
+        zh: "刷新",
         en: "Reload"
+    },
+    btn_collapse_all: {
+        zh: "折叠",
+        en: "Collapse"
+    },
+    btn_expand_all: {
+        zh: "展开",
+        en: "Expand"
     },
     loading_env_check: {
         zh: "请确保你选择了正确的 Python 环境 (需包含 torch|safetensors|Jax&orbax 库)。",
@@ -60,16 +68,16 @@ const messages = {
 
     // --- 状态栏与控制面板 (Status Bar / Control Panel) ---
     view_global_title: {
-        zh: "全局视图:",
-        en: "Global View:"
+        zh: "全局视图",
+        en: "Global View"
     },
     view_global_loaded: {
         zh: "已加载索引",
         en: "Index Loaded"
     },
     view_single_title: {
-        zh: "单文件视图:",
-        en: "Single File View:"
+        zh: "单文件视图",
+        en: "Single File View"
     },
     view_single_only: {
         zh: "仅显示当前文件内容",
@@ -105,6 +113,18 @@ const messages = {
         zh: "查看/折叠",
         en: "Inspect/Toggle"
     },
+    find_placeholder: {
+        zh: "搜索当前页面...",
+        en: "Search in this page..."
+    },
+    copy_key_success: {
+        zh: "已复制",
+        en: "Copied"
+    },
+    copy_key_failed: {
+        zh: "复制失败",
+        en: "Copy Failed"
+    },
 
     // --- VS Code 底部状态栏 (Extension Status Bar) ---
     status_python_tooltip_front: {
@@ -124,6 +144,74 @@ const messages = {
     file_right_click_tip: {
         zh: "请在资源管理器中右键点击 .pth|.pt|.safetensors|.ocdbt 文件使用此功能。",
         en: "Please right-click on .pth|.pt|.safetensors|.ocdbt files in the explorer to use this feature."
+    },
+    python_extension_missing: {
+        zh: "未检测到 Python 扩展(ms-python.python)。请先安装后再选择解释器。",
+        en: "Python extension (ms-python.python) is not installed. Install it before selecting an interpreter."
+    },
+    unsafe_load_confirm_title: {
+        zh: "检测到该文件安全加载失败。是否仅对此文件启用不安全加载（weights_only=False）并重试？",
+        en: "Safe loading failed for this file. Enable unsafe load (weights_only=False) for this file and retry?"
+    },
+    unsafe_load_confirm_detail: {
+        zh: "仅对可信文件启用。该选择会记住到缓存，后续打开此文件会继续使用不安全模式。",
+        en: "Enable only for trusted files. This choice is remembered in cache for future opens."
+    },
+    unsafe_load_enable_once: {
+        zh: "启用并重试",
+        en: "Enable and Retry"
+    },
+    open_unsafe_load_setting: {
+        zh: "打开默认设置",
+        en: "Open Default Setting"
+    },
+    unsafe_load_enabled_notice: {
+        zh: "已记住此文件为不安全加载模式。你也可以在设置中修改 pthViewer.allowUnsafeLoad。",
+        en: "Unsafe mode is remembered for this file. You can also change pthViewer.allowUnsafeLoad in settings."
+    },
+    unsafe_load_inline_hint: {
+        zh: "你可以在下方直接操作，或在设置中修改默认策略。",
+        en: "You can take action below, or change the default strategy in settings."
+    },
+    open_full_json_folder: {
+        zh: "JSON",
+        en: "JSON"
+    },
+    btn_find: {
+        zh: "查找",
+        en: "Find"
+    },
+    full_json_preview_load: {
+        zh: "加载完整结构",
+        en: "Load Full Structure"
+    },
+    full_json_preview_loading: {
+        zh: "正在从 SQLite 索引加载截断内容...",
+        en: "Loading truncated content from SQLite index..."
+    },
+    indexed_node_loading: {
+        zh: "正在加载内容...",
+        en: "Loading content..."
+    },
+    full_json_preview_failed: {
+        zh: "完整结构加载失败",
+        en: "Failed to load full structure"
+    },
+    full_json_preview_too_large: {
+        zh: "当前软件设置限制了可打开的大文件大小，无法在内嵌窗口打开。请手动查看导出的JSON文件。",
+        en: "Current editor settings limit large file opening. Cannot open inline preview. Please inspect the exported JSON file manually."
+    },
+    full_json_not_generated: {
+        zh: "尚未生成完整结构JSON文件。",
+        en: "Full structure JSON is not generated yet."
+    },
+    full_json_hint_generated: {
+        zh: "该节点已触发截断。可展开查看完整结构预览。",
+        en: "This node is truncated. Expand to preview the full structure."
+    },
+    dynamic_reloading_memory_notice: {
+        zh: "内存中未命中该文件，正在从磁盘重新加载到内存...",
+        en: "File not found in memory cache. Reloading from disk into memory..."
     },
 
     // --- 错误提示 (Errors) ---

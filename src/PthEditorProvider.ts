@@ -38,13 +38,15 @@ class PthDocument implements vscode.CustomDocument {
 export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<PthDocument> {
 
     public static readonly viewType = 'pth-viewer.pthEditor';
-    
-    private filePath: string = '';
-    private forceLocal: boolean = false;
-    // 缓存数据
-    private cacheJson : Record<string, any> = {}; // 结构 { "is_global": False,  "data": structure}
-    private cacheFilePath: string = '';
-    private cacheHash: string | null = '';
+
+    private panelStates = new WeakMap<vscode.WebviewPanel, {
+        filePath: string;
+        forceLocal: boolean;
+        cacheJson: Record<string, any>;
+        cacheFilePath: string;
+        cacheHash: string | null;
+        allowUnsafeLoadForCurrentFile: boolean;
+    }>();
 
     constructor(private readonly context: vscode.ExtensionContext) {
         // 初始化 Manager
@@ -71,27 +73,29 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
         webviewPanel: vscode.WebviewPanel,
         token: vscode.CancellationToken
     ): Promise<void> {
-        // 保存文件路径到成员变量
-        this.filePath = document.uri.fsPath;
-        this.forceLocal = false; // 初始默认全局模式
+        const state = this.getOrCreateState(webviewPanel, document.uri.fsPath);
+        state.forceLocal = false; // 初始默认全局模式
 
         // Webview 
         webviewPanel.webview.options = {
             enableScripts: true,
         };
+        webviewPanel.onDidDispose(() => {
+            this.panelStates.delete(webviewPanel);
+        });
 
         // 监听 Webview 发来的消息
         webviewPanel.webview.onDidReceiveMessage(async message => {
             // 监听 模式 切换
             if (message.command === 'switchMode') {
-                this.forceLocal = message.value; // update: true = 强制局部, false = 自动全局
-                this.loadPthContent(document, webviewPanel);
+                state.forceLocal = message.value; // update: true = 强制局部, false = 自动全局
+                this.loadPthContent(document, webviewPanel, state);
             }
             // 监听 查看数据请求
             if (message.command === 'inspect') {
                 const key = message.key;
                 const elementId = message.id;
-                this.inspectTensorData(document.uri.fsPath, key, elementId, webviewPanel);
+                this.inspectTensorData(document, document.uri.fsPath, key, elementId, webviewPanel, state);
             }
 
             // 监听 reload 
@@ -99,10 +103,10 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
                 console.log("[Editor] Reloading...");
                 
                 // 1. 尝试删除物理缓存文件
-                if (fs.existsSync(this.cacheFilePath)) {
+                if (fs.existsSync(state.cacheFilePath)) {
                     try {
-                        fs.unlinkSync(this.cacheFilePath); // 删除文件
-                        console.log(`[Cache] Deleted stale cache: ${this.cacheFilePath}`);
+                        fs.unlinkSync(state.cacheFilePath); // 删除文件
+                        console.log(`[Cache] Deleted stale cache: ${state.cacheFilePath}`);
                     } catch (e) {
                         console.error("[Cache] Failed to delete cache:", e);
                     }
@@ -111,28 +115,135 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
                 // 2. 通知 Python 后端释放内存 (清除 LOADED_MODELS)
                 try {
                     await PythonServerManager.getInstance().sendRequest('/release', {
-                        file_path: this.filePath
+                        file_path: state.filePath
                     });
                 } catch (e) { console.warn("Failed to release backend memory:", e); }
 
                 // 3. 清空前端内存对象
-                this.cacheJson = {}; 
+                state.cacheJson = {}; 
                 
                 // 4. 重新加载 (这会触发全新的 /load 请求并重新生成缓存)
-                this.loadPthContent(document, webviewPanel);
+                this.loadPthContent(document, webviewPanel, state);
+            }
+
+            if (message.command === 'enableUnsafeLoad') {
+                state.allowUnsafeLoadForCurrentFile = true;
+                this.markFileAsUnsafeTrusted(state.filePath);
+                vscode.window.showInformationMessage(t('unsafe_load_enabled_notice'));
+                this.loadPthContent(document, webviewPanel, state);
+            }
+
+            if (message.command === 'openUnsafeLoadSetting') {
+                await vscode.commands.executeCommand('workbench.action.openSettings', 'pthViewer.allowUnsafeLoad');
+            }
+
+            if (message.command === 'openFullStructureFolder') {
+                const fullPath = decodeURIComponent(message.fullPath as string);
+                await this.openFullStructureFolder(fullPath);
+            }
+
+            if (message.command === 'openFind') {
+                try {
+                    await vscode.commands.executeCommand('editor.action.webvieweditor.showFind');
+                } catch {
+                    await vscode.commands.executeCommand('actions.find');
+                }
+            }
+
+            if (message.command === 'copyKey') {
+                const keyText = typeof message.keyText === 'string' ? message.keyText : '';
+                const requestId = typeof message.requestId === 'string' ? message.requestId : '';
+                if (!keyText) {
+                    webviewPanel.webview.postMessage({ command: 'copyKeyResult', success: false, requestId });
+                    return;
+                }
+                try {
+                    await vscode.env.clipboard.writeText(keyText);
+                    webviewPanel.webview.postMessage({ command: 'copyKeyResult', success: true, requestId });
+                } catch (_e) {
+                    webviewPanel.webview.postMessage({ command: 'copyKeyResult', success: false, requestId });
+                }
+            }
+
+            if (message.command === 'loadIndexedTruncatedPane') {
+                const indexDbPath = decodeURIComponent(message.indexDbPath as string);
+                const rawSourceFilePath = typeof message.sourceFilePath === 'string' ? message.sourceFilePath : '';
+                const decodedSourceFilePath = rawSourceFilePath ? decodeURIComponent(rawSourceFilePath) : '';
+                const sourceFilePath = decodedSourceFilePath && decodedSourceFilePath !== 'undefined'
+                    ? decodedSourceFilePath
+                    : state.filePath;
+                const displayPath = decodeURIComponent(message.displayPath as string);
+                const containerId = message.containerId as string;
+                const offset = Number(message.offset ?? 0);
+                const limit = Number(message.limit ?? 200);
+                let result: any;
+                const canUseSqlite = !!indexDbPath;
+                if (canUseSqlite) {
+                    result = await PythonServerManager.getInstance().sendRequest('/tree_children_by_path', {
+                        file_path: sourceFilePath,
+                        index_db_path: indexDbPath,
+                        display_path: displayPath,
+                        offset,
+                        limit,
+                    });
+                }
+
+                const sqliteErrorText = String(result?.error || '').toLowerCase();
+                const sqliteUnavailable =
+                    !canUseSqlite ||
+                    !!result?.error && (
+                        sqliteErrorText.includes('no such table: nodes') ||
+                        sqliteErrorText.includes('unable to open database file') ||
+                        sqliteErrorText.includes('no such file') ||
+                        sqliteErrorText.includes('database disk image is malformed') ||
+                        sqliteErrorText.includes('not a database') ||
+                        sqliteErrorText.includes('path not found')
+                    );
+
+                if (sqliteUnavailable) {
+                    const modelStatus = await PythonServerManager.getInstance().sendRequest('/model_status', {
+                        file_path: sourceFilePath,
+                    });
+                    if (!modelStatus?.loaded_in_memory) {
+                        vscode.window.showInformationMessage(t('dynamic_reloading_memory_notice'));
+                    }
+                    result = await PythonServerManager.getInstance().sendRequest('/tree_children_dynamic', {
+                        file_path: sourceFilePath,
+                        display_path: displayPath,
+                        offset,
+                        limit,
+                        allow_unsafe: state.allowUnsafeLoadForCurrentFile,
+                    });
+                    if (result?.error && this.isUnsafeLoadRelatedError(result.error)) {
+                        const shouldRetryUnsafe = await this.handleUnsafeLoadPrompt(result.error, document, webviewPanel, state);
+                        if (shouldRetryUnsafe) {
+                            return;
+                        }
+                    }
+                }
+                webviewPanel.webview.postMessage({
+                    command: 'indexedTruncatedPaneData',
+                    payload: { containerId, displayPath, offset, limit, result }
+                });
             }
         });
 
         // 初始加载 (默认尝试全局)
-        this.loadPthContent(document, webviewPanel);
+        this.loadPthContent(document, webviewPanel, state);
     }
 
     // 抽离加载逻辑，方便刷新
-    private async loadPthContent(document: PthDocument, panel: vscode.WebviewPanel) {
+    private async loadPthContent(document: PthDocument, panel: vscode.WebviewPanel, state: { filePath: string; forceLocal: boolean; cacheJson: Record<string, any>; cacheFilePath: string; cacheHash: string | null; allowUnsafeLoadForCurrentFile: boolean; }) {
+        const defaultAllowUnsafeLoad = this.getDefaultAllowUnsafeLoad();
+        state.allowUnsafeLoadForCurrentFile = defaultAllowUnsafeLoad;
+        if (!defaultAllowUnsafeLoad) {
+            state.allowUnsafeLoadForCurrentFile = this.isUnsafeTrustedFile(state.filePath);
+        }
+
         // 计算文件大小
         let fileSizeStr = "0 B";
         try {
-            const stats = fs.statSync(this.filePath);
+            const stats = fs.statSync(state.filePath);
             fileSizeStr = formatFileSize(stats.size);
         } catch (e) { console.error(e); }
 
@@ -141,32 +252,37 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
             <div class="loading">
                 <div class="spinner"></div>
                 <p>${t('loading_file_size')}: ${fileSizeStr}</p>
-                <p>${t('loading_parsing')}... ${this.forceLocal ? t('loading_single_mode') : t('loading_auto_mode')}</p>
+                <p>${t('loading_parsing')}... ${state.forceLocal ? t('loading_single_mode') : t('loading_auto_mode')}</p>
                 ${t('loading_env_check')}
                 <p style="font-size:0.8em; color:var(--vscode-descriptionForeground);">${t('loading_cache_tip')}</p>
             </div>
         `, panel.webview);
         
         // 2. === 尝试读取缓存 ===
-        this.cacheHash = this.computeCacheKey(this.filePath, this.forceLocal);
-        this.cacheFilePath = this.getCachePath(this.cacheHash!);
-        if (fs.existsSync(this.cacheFilePath)) {
+        state.cacheHash = this.computeCacheKey(state.filePath, state.forceLocal);
+        state.cacheFilePath = this.getCachePath(state.cacheHash!);
+        if (fs.existsSync(state.cacheFilePath)) {
             try {
-                console.log(`[Cache] Hit! Loading from ${this.cacheFilePath}`);
-                const cacheRaw = fs.readFileSync(this.cacheFilePath, 'utf-8');                    
-                this.cacheJson = JSON.parse(cacheRaw).data;
+                console.log(`[Cache] Hit! Loading from ${state.cacheFilePath}`);
+                const cacheRaw = fs.readFileSync(state.cacheFilePath, 'utf-8');
+                const cacheContent = JSON.parse(cacheRaw);
+                state.cacheJson = cacheContent.data;
+                if (cacheContent?.meta?.allow_unsafe_load === true) {
+                    state.allowUnsafeLoadForCurrentFile = true;
+                    this.markFileAsUnsafeTrusted(state.filePath);
+                }
 
                 let totalSizeBytes = 0;
                 // 情况 1: Python 后端返回了计算好的总大小 (Global 模式)
-                if (this.cacheJson && this.cacheJson.total_size) {
-                    totalSizeBytes = this.cacheJson.total_size;
+                if (state.cacheJson && state.cacheJson.total_size) {
+                    totalSizeBytes = state.cacheJson.total_size;
                     console.log(`[Size] Using size calculated by Python: ${totalSizeBytes}`);
                     fileSizeStr = formatFileSize(totalSizeBytes);
                 } 
                 // 情况 2: 单文件模式 (或者 Python 端没有返回 total_size)
                 else {}
                 // 渲染缓存的数据
-                const htmlTree = generatePageHtml(this.cacheJson, this.forceLocal, fileSizeStr);
+                const htmlTree = generatePageHtml(state.cacheJson, state.forceLocal, fileSizeStr, state.filePath);
                 
                 // 可以在界面上加一个小标记提示是缓存内容 (可选)
                 // 这里的 render 调用保持不变
@@ -184,11 +300,22 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
             console.log("Requesting load from Python Server...");
             // 替代原来的 cp.exec
             const result = await PythonServerManager.getInstance().sendRequest('/load', {
-                file_path: this.filePath,
-                force_local: this.forceLocal
+                file_path: state.filePath,
+                force_local: state.forceLocal,
+                allow_unsafe: state.allowUnsafeLoadForCurrentFile,
+                cache_dir: this.getCacheDirPath(),
+                cache_key: state.cacheHash
             });
 
             if (result.error) {
+                const shouldRetryUnsafe = await this.handleUnsafeLoadPrompt(result.error, document, panel, state);
+                if (shouldRetryUnsafe) {
+                    return;
+                }
+                if (this.isUnsafeLoadRelatedError(result.error)) {
+                    this.renderUnsafeLoadError(panel, result.error);
+                    return;
+                }
                 // 这是 Python 服务器内部捕获的错误  Python 已经正常启动 但是 出错
                 panel.webview.html = getWebviewContent(
                     `<h3>${t('err_parse_error')}</h3><pre>${result.error}</pre>`, 
@@ -196,33 +323,33 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
                 );
             } else {
                 // 4. 解析 Python 返回的 JSON
-                this.cacheJson = result; // 结果格式应该和原来一致
+                state.cacheJson = result; // 结果格式应该和原来一致
 
-                if (this.cacheJson.error) {
+                if (state.cacheJson.error) {
                     panel.webview.html = getWebviewContent(
-                        `<h3>${t('err_data_read')}:</h3><pre>${this.cacheJson.error}</pre>`, 
+                        `<h3>${t('err_data_read')}:</h3><pre>${state.cacheJson.error}</pre>`, 
                         panel.webview
                     );
                 } else {
                     // 5. === 解析成功，写入缓存 ===
                     try {
-                        this.saveToCache(this.cacheJson)
-                        console.log(`[Cache] Saved to: ${this.cacheFilePath}`);
+                        this.saveToCache(state.cacheJson, state)
+                        console.log(`[Cache] Saved to: ${state.cacheFilePath}`);
                     } catch (e) {
                         console.error("[Cache] Write failed:", e);
                     }
 
                     let totalSizeBytes = 0;
                     // 情况 1: Python 后端返回了计算好的总大小 (Global 模式)
-                    if (this.cacheJson && this.cacheJson.total_size) {
-                        totalSizeBytes = this.cacheJson.total_size;
+                    if (state.cacheJson && state.cacheJson.total_size) {
+                        totalSizeBytes = state.cacheJson.total_size;
                         console.log(`[Size] Using size calculated by Python: ${totalSizeBytes}`);
                         fileSizeStr = formatFileSize(totalSizeBytes);
                     } 
                     // 情况 2: 单文件模式 (或者 Python 端没有返回 total_size)
                     else {}
                     // 6. 生成 HTML 树状图并显示
-                    const htmlTree = generatePageHtml(this.cacheJson, this.forceLocal, fileSizeStr);
+                    const htmlTree = generatePageHtml(state.cacheJson, state.forceLocal, fileSizeStr, state.filePath);
                     panel.webview.html = getWebviewContent(htmlTree, panel.webview);
                 }
             }
@@ -230,6 +357,14 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
             // 捕获Python启动失败的异常
             console.error("Load failed:", e);
             const errorMsg = e.message || "Unknown error";
+            const shouldRetryUnsafe = await this.handleUnsafeLoadPrompt(errorMsg, document, panel, state);
+            if (shouldRetryUnsafe) {
+                return;
+            }
+            if (this.isUnsafeLoadRelatedError(errorMsg)) {
+                this.renderUnsafeLoadError(panel, errorMsg);
+                return;
+            }
 
             // 区分错误类型
             // 情况 A: 超时错误 -> 显示在 Tooltip (Toast)
@@ -277,7 +412,7 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
     
 
     // 新增：专门用于获取 Tensor 数据的函数
-    private async inspectTensorData(filePath: string, key: string, elementId: string, panel: vscode.WebviewPanel) {
+    private async inspectTensorData(document: PthDocument, filePath: string, key: string, elementId: string, panel: vscode.WebviewPanel, state: { filePath: string; forceLocal: boolean; cacheJson: Record<string, any>; cacheFilePath: string; cacheHash: string | null; allowUnsafeLoadForCurrentFile: boolean; }) {
         // 1. 解析 Key 路径
         let keys: string[] = [];
         try {
@@ -291,7 +426,7 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
         let targetNode: any = null;
         try {
             // 在缓存树中查找目标节点
-            targetNode = this.findNodeByPath(this.cacheJson.data, keys);
+            targetNode = this.findNodeByPath(state.cacheJson.data, keys);
                 
             // ✅ 命中缓存：如果 __pth_overview_pth__ 字段里已经有 stats 了
             if (targetNode && targetNode.__pth_overview_pth__ && targetNode.__pth_overview_pth__.stats) {
@@ -305,11 +440,24 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
 
         // 3. === 缓存未命中，请求 Server ===
         try {
+            const modelStatus = await PythonServerManager.getInstance().sendRequest('/model_status', {
+                file_path: filePath,
+            });
+            if (!modelStatus?.loaded_in_memory) {
+                vscode.window.showInformationMessage(t('dynamic_reloading_memory_notice'));
+            }
             const result = await PythonServerManager.getInstance().sendRequest('/inspect', {
                 file_path: filePath,
-                key: key // 直接传 JSON 字符串，Server 端会解析
+                key: key, // 直接传 JSON 字符串，Server 端会解析
+                allow_unsafe: state.allowUnsafeLoadForCurrentFile,
             });
             if (result.error) {
+                 if (this.isUnsafeLoadRelatedError(result.error)) {
+                    const shouldRetryUnsafe = await this.handleUnsafeLoadPrompt(result.error, document, panel, state);
+                    if (shouldRetryUnsafe) {
+                        return;
+                    }
+                 }
                  panel.webview.postMessage({ command: 'showData', id: elementId, error: result.error });
             } else {
                 panel.webview.postMessage({ command: 'showData', id: elementId, data: result });
@@ -318,7 +466,7 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
                 
                 // 4. === 异步写入缓存 (Update __pth_overview_pth__) ===
                 // 只有当数据正常（不是 error），且我们之前成功定位到了缓存文件和节点时，才写入
-                if (!result.error && targetNode && this.cacheFilePath) {
+                if (!result.error && targetNode && state.cacheFilePath) {
                     try {
                         // 初始化 __pth_overview_pth__ (如果 Python 没有返回 __pth_overview_pth__ 字段)
                         if (!targetNode.__pth_overview_pth__) {
@@ -335,8 +483,8 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
                         
                         // 写入磁盘
                         try {
-                            this.saveToCache(this.cacheJson);
-                            console.log(`[Cache] Updated to: ${this.cacheFilePath}`);
+                            this.saveToCache(state.cacheJson, state);
+                            console.log(`[Cache] Updated to: ${state.cacheFilePath}`);
                         } catch (e) {
                             console.error("[Cache] Update failed:", e);
                         }
@@ -373,8 +521,7 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
      * 获取缓存文件的完整路径
      */
     private getCachePath(hash: string): string {
-        const storagePath = this.context.globalStorageUri.fsPath;
-        const cacheDir = path.join(storagePath, 'cache');
+        const cacheDir = this.getCacheDirPath();
         // 确保存储目录存在
         if (!fs.existsSync(cacheDir)) {
             fs.mkdirSync(cacheDir, { recursive: true });
@@ -382,26 +529,32 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
         return path.join(cacheDir, `${hash}.json`);
     }
 
+    private getCacheDirPath(): string {
+        const storagePath = this.context.globalStorageUri.fsPath;
+        return path.join(storagePath, 'cache');
+    }
+
     /**
      * 将解析结果写入缓存
      */
-    private saveToCache(resultData: any) {
-        const stats = fs.statSync(this.filePath);
+    private saveToCache(resultData: any, state: { filePath: string; forceLocal: boolean; cacheJson: Record<string, any>; cacheFilePath: string; cacheHash: string | null; allowUnsafeLoadForCurrentFile: boolean; }) {
+        const stats = fs.statSync(state.filePath);
         
         // 构建缓存对象 (为未来扩展 Metadata 做准备)
         const cacheContent = {
             version: "1.0",
-            source_hash: this.cacheHash,
+            source_hash: state.cacheHash,
             timestamp: Date.now(),
             meta: {
-                file_path: this.filePath,
+                file_path: state.filePath,
                 file_size: stats.size,
+                allow_unsafe_load: state.allowUnsafeLoadForCurrentFile,
                 // TODO: 这里未来可以扩展 param_count, arch 等信息
             },
             data: resultData // Python 返回的原始结构
         };
 
-        fs.writeFileSync(this.cacheFilePath, JSON.stringify(cacheContent), 'utf-8');
+        fs.writeFileSync(state.cacheFilePath, JSON.stringify(cacheContent), 'utf-8');
     }
 
     // ----------------------------------------------------------------------
@@ -429,6 +582,152 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
             return null;
         }
     }
+
+    private getDefaultAllowUnsafeLoad(): boolean {
+        const config = vscode.workspace.getConfiguration('pthViewer');
+        return config.get<boolean>('allowUnsafeLoad', false);
+    }
+
+    private getUnsafeTrustStorePath(): string {
+        const storagePath = this.context.globalStorageUri.fsPath;
+        if (!fs.existsSync(storagePath)) {
+            fs.mkdirSync(storagePath, { recursive: true });
+        }
+        return path.join(storagePath, 'unsafe-load-trusted-files.json');
+    }
+
+    private normalizeFileKey(filePath: string): string {
+        return path.normalize(filePath).toLowerCase();
+    }
+
+    private readUnsafeTrustStore(): Record<string, boolean> {
+        const trustFilePath = this.getUnsafeTrustStorePath();
+        if (!fs.existsSync(trustFilePath)) {
+            return {};
+        }
+
+        try {
+            const raw = fs.readFileSync(trustFilePath, 'utf-8');
+            return JSON.parse(raw);
+        } catch {
+            return {};
+        }
+    }
+
+    private writeUnsafeTrustStore(content: Record<string, boolean>) {
+        const trustFilePath = this.getUnsafeTrustStorePath();
+        fs.writeFileSync(trustFilePath, JSON.stringify(content), 'utf-8');
+    }
+
+    private isUnsafeTrustedFile(filePath: string): boolean {
+        const trustMap = this.readUnsafeTrustStore();
+        const key = this.normalizeFileKey(filePath);
+        return trustMap[key] === true;
+    }
+
+    private markFileAsUnsafeTrusted(filePath: string) {
+        const trustMap = this.readUnsafeTrustStore();
+        const key = this.normalizeFileKey(filePath);
+        trustMap[key] = true;
+        this.writeUnsafeTrustStore(trustMap);
+    }
+
+    private async handleUnsafeLoadPrompt(errorText: string, document: PthDocument, panel: vscode.WebviewPanel, state: { filePath: string; forceLocal: boolean; cacheJson: Record<string, any>; cacheFilePath: string; cacheHash: string | null; allowUnsafeLoadForCurrentFile: boolean; }): Promise<boolean> {
+        const defaultAllowUnsafeLoad = this.getDefaultAllowUnsafeLoad();
+        if (defaultAllowUnsafeLoad) {
+            return false;
+        }
+
+        if (state.allowUnsafeLoadForCurrentFile) {
+            return false;
+        }
+
+        if (!this.isUnsafeLoadRelatedError(errorText)) {
+            return false;
+        }
+
+        const actionEnable = t('unsafe_load_enable_once');
+        const actionOpenSettings = t('open_unsafe_load_setting');
+        const picked = await vscode.window.showWarningMessage(
+            `${t('unsafe_load_confirm_title')}\n${t('unsafe_load_confirm_detail')}`,
+            { modal: true },
+            actionEnable,
+            actionOpenSettings
+        );
+
+        if (picked === actionOpenSettings) {
+            await vscode.commands.executeCommand('workbench.action.openSettings', 'pthViewer.allowUnsafeLoad');
+            return false;
+        }
+
+        if (picked !== actionEnable) {
+            return false;
+        }
+
+        state.allowUnsafeLoadForCurrentFile = true;
+        this.markFileAsUnsafeTrusted(state.filePath);
+        vscode.window.showInformationMessage(t('unsafe_load_enabled_notice'));
+        this.loadPthContent(document, panel, state);
+        return true;
+    }
+
+    private getOrCreateState(panel: vscode.WebviewPanel, filePath: string) {
+        const existing = this.panelStates.get(panel);
+        if (existing) {
+            return existing;
+        }
+        const state = {
+            filePath,
+            forceLocal: false,
+            cacheJson: {},
+            cacheFilePath: '',
+            cacheHash: '' as string | null,
+            allowUnsafeLoadForCurrentFile: false,
+        };
+        this.panelStates.set(panel, state);
+        return state;
+    }
+
+    private isUnsafeLoadRelatedError(errorText: string): boolean {
+        const lower = errorText.toLowerCase();
+        return (
+            lower.includes('weights_only') ||
+            lower.includes('weights only') ||
+            lower.includes('unsupported global') ||
+            lower.includes('pickle')
+        );
+    }
+
+    private renderUnsafeLoadError(panel: vscode.WebviewPanel, errorText: string) {
+        const manager = PythonServerManager.getInstance();
+        const currentPyPath = manager.getInterpreterPath();
+        panel.webview.html = getWebviewContent(
+            `
+            <div style="padding: 10px; border: 1px solid var(--vscode-inputValidation-errorBorder); border-radius: 5px;">
+                <h3 style="margin-top:0;">${t('err_python_run')}</h3>
+                <p><strong>${t('unsafe_load_confirm_title')}</strong></p>
+                <p>${t('unsafe_load_inline_hint')}</p>
+                <div style="display:flex; gap:10px; margin: 8px 0 12px 0;">
+                    <button onclick="vscode.postMessage({command: 'enableUnsafeLoad'})">${t('unsafe_load_enable_once')}</button>
+                    <button onclick="vscode.postMessage({command: 'openUnsafeLoadSetting'})">${t('open_unsafe_load_setting')}</button>
+                </div>
+                <p>${t('err_python_path')} <code style="background:var(--vscode-textBlockQuote-background); padding:2px 4px;">${currentPyPath}</code></p>
+                <hr style="border: 0; border-top: 1px solid var(--vscode-textBlockQuote-border);">
+                <h4>${t('err_stderr_output')}</h4>
+                <pre style="color:var(--vscode-errorForeground); overflow:auto; max-height:300px;">${errorText}</pre>
+            </div>
+            `,
+            panel.webview
+        );
+    }
+
+    private async openFullStructureFolder(fullPath: string) {
+        if (!fullPath || !fs.existsSync(fullPath)) {
+            vscode.window.showWarningMessage(t('full_json_not_generated'));
+            return;
+        }
+        await vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(fullPath));
+    }
 }
 
 
@@ -438,10 +737,11 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
 //  辅助函数 (保持不变)
 // ----------------------------------------------------
 
-function generatePageHtml(result: any, isForceLocal: boolean, fileSizeStr: string): string {
+function generatePageHtml(result: any, isForceLocal: boolean, fileSizeStr: string, fallbackSourceFilePath: string = ''): string {
     const isGlobal = result.is_global;
     const data = result.data;
     const indexFile = result.index_file || "";
+    const fullStructurePath = result.full_structure_path || "";
 
     // 定义图标和标题文本
     let icon = isGlobal ? '🌐' : '📄';
@@ -466,6 +766,8 @@ function generatePageHtml(result: any, isForceLocal: boolean, fileSizeStr: strin
     //    <div class="status-right"> [刷新按钮] [切换模式按钮] </div>
     // </div>
 
+    const openFullJsonFolderButton = `<button onclick="vscode.postMessage({command: 'openFullStructureFolder', fullPath: '${encodeURIComponent(fullStructurePath || "")}'})">${t('open_full_json_folder')}</button>`;
+
     let controlBar = `
         <div class="status-bar ${statusClass}">
             <div class="status-left">
@@ -475,8 +777,22 @@ function generatePageHtml(result: any, isForceLocal: boolean, fileSizeStr: strin
                 <span class="size-badge">${fileSizeStr}</span>
             </div>
             <div class="status-right">
+                ${openFullJsonFolderButton}
+                <button class="icon-btn" onclick="vscode.postMessage({command: 'openFind'})" title="${t('btn_find')}">
+                    <span class="codicon-symbol icon-find">⌕</span> ${t('btn_find')}
+                </button>
                 <button class="icon-btn" onclick="vscode.postMessage({command: 'reload'})" title="${t('btn_reload')}">
                     <span class="codicon-symbol">↻</span> ${t('btn_reload')}
+                </button>
+                <button
+                    id="collapse-toggle-btn"
+                    class="icon-btn"
+                    onclick="toggleCollapseAllState()"
+                    title="${t('btn_collapse_all')}"
+                    data-collapse-text="${t('btn_collapse_all')}"
+                    data-expand-text="${t('btn_expand_all')}"
+                >
+                    <span class="codicon-symbol icon-collapse">▸</span> <span class="btn-label">${t('btn_collapse_all')}</span>
                 </button>
                 <button style="display:${isGlobal || isForceLocal ? 'inline-block' : 'none'}" onclick="vscode.postMessage({command: 'switchMode', value: ${switchCmdValue}})">
                     ${switchBtnText}
@@ -485,7 +801,10 @@ function generatePageHtml(result: any, isForceLocal: boolean, fileSizeStr: strin
         </div>
     `;
 
-    const treeHtml = generateJsonHtml(data);
+    const sourceFilePath = (typeof result?.source_file_path === 'string' && result.source_file_path && result.source_file_path !== 'undefined')
+        ? result.source_file_path
+        : fallbackSourceFilePath;
+    const treeHtml = generateJsonHtml(data, [], fullStructurePath, result.full_structure_index_path || "", sourceFilePath, "$");
     return controlBar + treeHtml;
 }
 
@@ -498,6 +817,9 @@ export function getWebviewContent(bodyContent: string, webview?: vscode.Webview)
         <style>
             :root {
                     --vscode-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                    --tree-line-color: color-mix(in srgb, var(--vscode-descriptionForeground) 40%, transparent);
+                    --tree-line-width: 1px;
+                    --tree-branch-length: 10px;
                 }
             /* 1. 全局样式：使用 VS Code 字体和基础颜色 */
             body { 
@@ -587,6 +909,17 @@ export function getWebviewContent(bodyContent: string, webview?: vscode.Webview)
                 font-size: 1.1em;
                 line-height: 1;
             }
+            .icon-btn .icon-find {
+                display: inline-block;
+                transform: translateY(-1px);
+                font-size: 1.18em;
+            }
+            .icon-btn .icon-collapse {
+                display: inline-block;
+                transform: translateY(-1px);
+                font-size: 1.28em;
+                line-height: 1;
+            }
 
             /* 移动端适配 (如果窗口很窄) */
             @media (max-width: 600px) {
@@ -603,12 +936,37 @@ export function getWebviewContent(bodyContent: string, webview?: vscode.Webview)
             /* 3. 列表/树状结构基础样式 */
             ul { 
                 list-style-type: none; 
-                padding-left: 20px; 
-                margin: 0;
+                padding-left: 18px; 
+                margin: 2px 0 0 0;
             }
             li { 
-                margin: 0 0 5px 0;
+                margin: 0 0 4px 0;
                 line-height: 1.4;
+                position: relative;
+                padding-left: 12px;
+            }
+            li::before {
+                content: '';
+                position: absolute;
+                left: 0;
+                top: 11px;
+                width: var(--tree-branch-length);
+                border-top: var(--tree-line-width) solid var(--tree-line-color);
+            }
+            li.has-details::before,
+            li.has-toggle::before {
+                display: none;
+            }
+            li.truncated-item::before {
+                display: none;
+            }
+            li::after {
+                content: '';
+                position: absolute;
+                left: 0;
+                top: 0;
+                bottom: 0;
+                border-left: var(--tree-line-width) solid var(--tree-line-color);
             }
 
             /* 4. 树状折叠/展开 (details/summary) 样式 */
@@ -621,28 +979,97 @@ export function getWebviewContent(bodyContent: string, webview?: vscode.Webview)
                 /* 颜色使用 VS Code 控件的强调色 */
                 color: var(--vscode-terminal-ansiBrightBlue);
                 user-select: none;
-                padding-left: 15px;
+                padding-left: 14px;
                 position: relative;
+                display: inline-flex;
+                align-items: center;
+                gap: 4px;
+                list-style: none;
             }
-            
-            /* 模拟 VS Code 的树形指示图标 */
+            details > summary::-webkit-details-marker {
+                display: none;
+            }
+            details > summary::marker {
+                content: '';
+            }
             details > summary::before {
-               
+                content: '▸';
                 position: absolute;
                 left: 0;
-                color: var(--vscode-editorGroupHeader-tabsBorder);
+                top: 50%;
+                transform: translateY(-50%);
+                color: var(--vscode-descriptionForeground);
+                font-size: 20px;
+                line-height: 1;
                 transition: transform 0.1s;
             }
             details[open] > summary::before {
-              
-                transform: rotate(0deg);
+                content: '▾';
+                transform: translateY(-62%);
             }
 
             /* 5. 数据类型高亮 */
             /* 字典 Key/列表 Index */
             .key-name { 
                 color: var(--vscode-terminal-ansiYellow); 
-                font-weight: bold;
+                font-weight: 600;
+            }
+            .node-key-chip {
+                display: inline-flex;
+                align-items: center;
+                color: var(--vscode-terminal-ansiYellow);
+                font-weight: 600;
+                margin-right: 6px;
+            }
+            .node-sep {
+                color: var(--vscode-descriptionForeground);
+                margin-right: 6px;
+            }
+            .node-inline {
+                display: flex;
+                align-items: flex-start;
+                gap: 6px;
+                flex-wrap: wrap;
+            }
+            .copy-key-btn {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                margin-left: 4px;
+                padding: 0 5px;
+                border: 1px solid var(--vscode-widget-border);
+                border-radius: 3px;
+                color: var(--vscode-descriptionForeground);
+                background: transparent;
+                cursor: pointer;
+                font-size: 0.75em;
+                line-height: 1.2;
+            }
+            .copy-key-btn:hover {
+                background: var(--vscode-editor-inactiveSelectionBackground);
+            }
+            .copy-key-btn.copy-pending {
+                border-color: var(--vscode-descriptionForeground);
+                color: var(--vscode-descriptionForeground);
+                opacity: 0.85;
+            }
+            .copy-key-btn.copy-ok {
+                border-color: var(--vscode-testing-iconPassed);
+                color: var(--vscode-testing-iconPassed);
+                background: color-mix(in srgb, var(--vscode-testing-iconPassed) 18%, transparent);
+            }
+            .copy-key-btn.copy-fail {
+                border-color: var(--vscode-errorForeground);
+                color: var(--vscode-errorForeground);
+                background: color-mix(in srgb, var(--vscode-errorForeground) 14%, transparent);
+            }
+            .node-inline .node-key-chip {
+                align-self: flex-start;
+                line-height: 1.4;
+                margin-top: 1px;
+            }
+            .node-inline .node-value {
+                display: inline-block;
             }
             /* Tensor 信息高亮 */
             .tensor-info { 
@@ -690,22 +1117,108 @@ export function getWebviewContent(bodyContent: string, webview?: vscode.Webview)
                 background-color: var(--vscode-button-secondaryHoverBackground);
             }
             .data-preview {
-                margin-top: 5px;
-                padding: 8px;
+                margin-top: 1px;
+                padding: 1px 8px 6px;
                 background-color: var(--vscode-editor-inactiveSelectionBackground);
-                border-left: 3px solid var(--vscode-charts-blue);
+                border: 1px solid var(--vscode-editorWidget-border);
                 font-family: 'Consolas', monospace;
                 font-size: 0.85em;
-                white-space: pre; /* 保持 PyTorch 的多维缩进格式 */
-                overflow-x: auto;
+                white-space: normal;
+            }
+            li > .data-preview,
+            .indexed-node > .data-preview {
+                margin-top: 2px;
             }
             .stats-row {
-                margin-bottom: 5px;
+                margin-bottom: 2px;
                 color: var(--vscode-descriptionForeground);
                 border-bottom: 1px dashed var(--vscode-editorRuler-foreground);
-                padding-bottom: 4px;
+                padding-bottom: 2px;
+                display: flex;
+                flex-wrap: nowrap;
+                gap: 12px;
+                white-space: nowrap;
+                overflow-x: auto;
             }
-            .stats-item { margin-right: 15px; }
+            .stats-item { margin-right: 0; }
+            .tensor-preview-text {
+                margin: 2px 0 0;
+                white-space: pre;
+                overflow-x: auto;
+                font-family: 'Consolas', monospace;
+                font-size: 0.85em;
+                line-height: 1.35;
+                background: transparent;
+                border: none;
+                padding: 0;
+            }
+
+            .truncated-toggle {
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                cursor: pointer;
+                user-select: none;
+            }
+            .truncated-toggle .arrow {
+                display: inline-block;
+                width: 12px;
+                text-align: center;
+                color: var(--vscode-descriptionForeground);
+                font-size: 10px;
+                line-height: 1;
+            }
+            .full-structure-pane {
+                display: none;
+                margin: 6px 0 8px 22px;
+                border: 1px solid var(--vscode-widget-border);
+                border-radius: 4px;
+                background: var(--vscode-editor-background);
+                min-height: 120px;
+                max-height: 320px;
+                height: 200px;
+                resize: vertical;
+                overflow: auto;
+                padding: 8px 8px 8px 12px;
+                border-left: var(--tree-line-width) solid var(--tree-line-color);
+            }
+            .full-structure-pane .hint {
+                color: var(--vscode-descriptionForeground);
+                margin-bottom: 8px;
+            }
+            .indexed-tree {
+                margin: 0;
+                padding-left: 18px;
+            }
+            .webview-find {
+                position: sticky;
+                top: 6px;
+                z-index: 9999;
+                float: right;
+                display: none;
+                align-items: center;
+                gap: 6px;
+                padding: 6px;
+                border: 1px solid var(--vscode-widget-border);
+                border-radius: 6px;
+                background: var(--vscode-editorWidget-background);
+            }
+            .webview-find input {
+                min-width: 220px;
+                padding: 4px 6px;
+                border: 1px solid var(--vscode-input-border);
+                background: var(--vscode-input-background);
+                color: var(--vscode-input-foreground);
+                border-radius: 4px;
+            }
+            .webview-find .mini-btn {
+                padding: 2px 6px;
+                border: 1px solid var(--vscode-widget-border);
+                background: transparent;
+                color: var(--vscode-foreground);
+                border-radius: 4px;
+                cursor: pointer;
+            }
         </style>
         <script>
             <!-- 实现点击按钮, 有vscode事件触发 -->
@@ -745,6 +1258,393 @@ export function getWebviewContent(bodyContent: string, webview?: vscode.Webview)
                 });
             }
 
+            let collapsedByToolbar = false;
+            let initialRenderSnapshot = null;
+
+            const pendingCopyButtons = {};
+
+            function setCopyButtonFeedback(btn, success) {
+                if (!btn) return;
+                const originalText = btn.dataset.originalText || 'copy';
+                btn.classList.remove('copy-pending', 'copy-ok', 'copy-fail');
+                btn.classList.add(success ? 'copy-ok' : 'copy-fail');
+                btn.textContent = success ? '${t('copy_key_success')}' : '${t('copy_key_failed')}';
+                setTimeout(() => {
+                    btn.classList.remove('copy-pending', 'copy-ok', 'copy-fail');
+                    btn.textContent = originalText;
+                }, 900);
+            }
+
+            function copyKeyName(btnEl) {
+                if (!btnEl) return;
+                const text = decodeURIComponent(btnEl.dataset.keyText || '');
+                if (!text) return;
+                const requestId = 'copy-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+                if (btnEl) {
+                    btnEl.dataset.originalText = btnEl.dataset.originalText || btnEl.textContent || 'copy';
+                    btnEl.classList.remove('copy-ok', 'copy-fail');
+                    btnEl.classList.add('copy-pending');
+                    btnEl.textContent = '...';
+                    pendingCopyButtons[requestId] = btnEl;
+                }
+                vscode.postMessage({
+                    command: 'copyKey',
+                    keyText: text,
+                    requestId,
+                });
+            }
+
+            function captureInitialTreeState() {
+                const details = Array.from(document.querySelectorAll('details')).map(el => ({
+                    el,
+                    isOpen: el.hasAttribute('open'),
+                }));
+                const panes = Array.from(document.querySelectorAll('.full-structure-pane')).map(el => ({
+                    el,
+                    display: window.getComputedStyle(el).display,
+                }));
+                const arrows = Array.from(document.querySelectorAll('.truncated-toggle .arrow')).map(el => ({
+                    el,
+                    text: el.textContent || '▸',
+                }));
+                initialRenderSnapshot = { details, panes, arrows };
+            }
+
+            function updateCollapseButtonState(isCollapsed) {
+                const btn = document.getElementById('collapse-toggle-btn');
+                if (!btn) return;
+                const collapseText = btn.dataset.collapseText || '${t('btn_collapse_all')}';
+                const expandText = btn.dataset.expandText || '${t('btn_expand_all')}';
+                const text = isCollapsed ? expandText : collapseText;
+                const icon = btn.querySelector('.codicon-symbol');
+                const label = btn.querySelector('.btn-label');
+                if (icon) icon.textContent = isCollapsed ? '▾' : '▸';
+                if (label) label.textContent = text;
+                btn.title = text;
+            }
+
+            function collapseAllTreeNodes() {
+                // 折叠原始 JSON 树 (details/summary)
+                document.querySelectorAll('details[open]').forEach(el => {
+                    el.removeAttribute('open');
+                });
+
+                // 折叠截断面板及其内部子面板
+                document.querySelectorAll('.full-structure-pane').forEach(el => {
+                    el.style.display = 'none';
+                });
+
+                // 重置所有展开箭头
+                document.querySelectorAll('.truncated-toggle .arrow').forEach(el => {
+                    el.textContent = '▸';
+                });
+
+                // 放大镜预览不参与折叠/展开恢复，统一关闭
+                document.querySelectorAll('.data-preview').forEach(el => {
+                    el.style.display = 'none';
+                });
+            }
+
+            function restoreInitialTreeState() {
+                if (!initialRenderSnapshot) return;
+                (initialRenderSnapshot.details || []).forEach(item => {
+                    if (!item?.el) return;
+                    if (item.isOpen) item.el.setAttribute('open', '');
+                    else item.el.removeAttribute('open');
+                });
+                (initialRenderSnapshot.panes || []).forEach(item => {
+                    if (!item?.el) return;
+                    item.el.style.display = item.display || 'none';
+                });
+                (initialRenderSnapshot.arrows || []).forEach(item => {
+                    if (!item?.el) return;
+                    item.el.textContent = item.text || '▸';
+                });
+
+                // 恢复树结构时，不自动恢复放大镜预览
+                document.querySelectorAll('.data-preview').forEach(el => {
+                    el.style.display = 'none';
+                });
+            }
+
+            function toggleCollapseAllState() {
+                if (!collapsedByToolbar) {
+                    collapseAllTreeNodes();
+                    collapsedByToolbar = true;
+                } else {
+                    restoreInitialTreeState();
+                    collapsedByToolbar = false;
+                }
+                updateCollapseButtonState(collapsedByToolbar);
+            }
+
+            function setupWebviewFind() {
+                const box = document.getElementById('webview-find-box');
+                const input = document.getElementById('webview-find-input');
+                const prevBtn = document.getElementById('webview-find-prev');
+                const nextBtn = document.getElementById('webview-find-next');
+                const closeBtn = document.getElementById('webview-find-close');
+                if (!box || !input || !prevBtn || !nextBtn || !closeBtn) return;
+
+                const openFind = () => {
+                    box.style.display = 'inline-flex';
+                    input.focus();
+                    input.select();
+                };
+                const closeFind = () => {
+                    box.style.display = 'none';
+                };
+                const runFind = (forward) => {
+                    const term = String(input.value || '');
+                    if (!term) return;
+                    const found = window.find(term, false, !forward, true, false, false, false);
+                    if (!found) {
+                        window.find(term, false, !forward, true, false, false, true);
+                    }
+                };
+
+                prevBtn.addEventListener('click', () => runFind(false));
+                nextBtn.addEventListener('click', () => runFind(true));
+                closeBtn.addEventListener('click', closeFind);
+                input.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        runFind(!e.shiftKey);
+                    } else if (e.key === 'Escape') {
+                        e.preventDefault();
+                        closeFind();
+                    }
+                });
+                document.addEventListener('keydown', (e) => {
+                    const isFind = (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f';
+                    if (isFind) {
+                        e.preventDefault();
+                        openFind();
+                        return;
+                    }
+                    if (e.key === 'F3') {
+                        e.preventDefault();
+                        runFind(!e.shiftKey);
+                    }
+                });
+            }
+
+            window.addEventListener('DOMContentLoaded', () => {
+                captureInitialTreeState();
+                updateCollapseButtonState(false);
+                normalizePreviewLayout(document);
+            });
+
+            function displayPathToPathArray(displayPath) {
+                let p = displayPath || '';
+                if (!p || p === '$') return [];
+                if (p.startsWith('$.')) p = p.slice(2);
+                else if (p.startsWith('$')) p = p.slice(1);
+
+                const tokens = [];
+                const re = /([^.\\[\\]]+)|\\[(\\d+)\\]/g;
+                let m;
+                while ((m = re.exec(p)) !== null) {
+                    if (m[1] !== undefined) tokens.push(m[1]);
+                    else if (m[2] !== undefined) tokens.push(m[2]);
+                }
+                return tokens;
+            }
+
+            function normalizePreviewLayout(root) {
+                const scope = root || document;
+                scope.querySelectorAll('.node-inline .data-preview').forEach(preview => {
+                    const row = preview.closest('.node-inline');
+                    if (!row) return;
+                    const host = row.closest('li') || row.closest('.indexed-node');
+                    if (!host) return;
+                    if (preview.parentElement === host) return;
+                    host.appendChild(preview);
+                });
+            }
+
+            function formatIndexedKeyLabel(parentNodeType, key) {
+                if (parentNodeType === 'array') return '[' + key + ']';
+                return '"' + key + '"';
+            }
+
+            function renderIndexedValue(c) {
+                const type = c.node_type ?? '';
+                if (type === 'tensor' || type === 'tensor_ref') {
+                    const dtype = c.dtype || '?';
+                    const shape = Array.isArray(c.shape) ? c.shape : [];
+                    const shapeStr = shape.length === 0
+                        ? '<span style="color:var(--vscode-textLink-foreground);">[Scalar]</span>'
+                        : '[ ' + shape.join('×') + ' ]';
+                    const detailStr = type === 'tensor' ? (shapeStr + ' (' + dtype + ')') : '${t('tag_ref')}';
+                    let infoClass = 'tensor-info';
+                    if (type === 'tensor_ref') infoClass += ' ref';
+                    return '<span class="' + infoClass + '">' + detailStr + '</span>';
+                }
+                if (type === 'object' || type === 'array') {
+                    // 索引树直接复用后端 summary，其中已包含元素总数 (例如 Dict {5} / List [128])
+                    return '<span>' + String(c.summary ?? (type === 'object' ? 'Dict {}' : 'List []')) + '</span>';
+                }
+                return '<span>' + String(c.summary ?? '') + '</span>';
+            }
+
+            function renderIndexedChildren(container, children, append, parentNodeType) {
+                let tree = container.querySelector(':scope > ul.indexed-tree');
+                if (!append || !tree) {
+                    container.innerHTML = '';
+                    tree = document.createElement('ul');
+                    tree.className = 'indexed-tree';
+                    container.appendChild(tree);
+                }
+
+                (children || []).forEach(c => {
+                    const key = c.key ?? '';
+                    const rowId = 'idx-node-' + String(c.id ?? key).replace(/[^a-zA-Z0-9_-]/g, '-');
+                    const childContainerId = rowId + '-children';
+                    const keyLabel = formatIndexedKeyLabel(parentNodeType, key);
+                    const keyPrefix = '<span class="key-name">' + keyLabel + ': </span>';
+                    const valueHtml = renderIndexedValue(c);
+
+                    let expandHtml = '';
+                    if (c.is_expandable) {
+                        expandHtml =
+                            '<span class="truncated-toggle" id="' + rowId + '-toggle" onclick="toggleIndexedNode(\\'' + childContainerId + '\\', \\'' + rowId + '-toggle\\', \\'' + encodeURIComponent(c.display_path || '') + '\\')">'
+                            + '<span class="arrow">▸</span>'
+                            + '</span>';
+                    } else {
+                        expandHtml = '<span class="truncated-toggle"><span class="arrow"></span></span>';
+                    }
+
+                    let inspectHtml = '';
+                    if ((c.node_type ?? '') === 'tensor') {
+                        const pathArray = displayPathToPathArray(c.display_path || '');
+                        const safePath = encodeURIComponent(JSON.stringify(pathArray));
+                        const inspectId = 'idx-inspect-' + String(c.id ?? key).replace(/[^a-zA-Z0-9_-]/g, '-');
+                        inspectHtml =
+                            '<span class="inspect-btn" title="${t('btn_inspect_title')}" onclick="toggleInspect(\\'' + safePath + '\\', \\'' + inspectId + '\\')">🔍</span>'
+                            + '<div id="' + inspectId + '" class="data-preview" style="display:none;"></div>';
+                    }
+
+                    const li = document.createElement('li');
+                    if (c.is_expandable) li.classList.add('has-toggle');
+                    li.innerHTML =
+                        '<div class="node-inline">'
+                        + expandHtml
+                        + keyPrefix
+                        + '<span class="node-value">' + valueHtml + '</span>'
+                        + inspectHtml
+                        + '</div>'
+                        + '<div id="' + childContainerId + '" class="full-structure-pane indexed-children" style="display:none; margin-left:20px;"></div>';
+                    tree.appendChild(li);
+                });
+                normalizePreviewLayout(container);
+            }
+
+            function requestIndexedPanePage(containerId, indexDbPath, sourceFilePath, displayPath, offset, limit) {
+                const container = document.getElementById(containerId);
+                if (!container) return;
+                if (container.dataset.loading === '1') return;
+                container.dataset.loading = '1';
+                vscode.postMessage({
+                    command: 'loadIndexedTruncatedPane',
+                    indexDbPath,
+                    sourceFilePath,
+                    displayPath,
+                    containerId,
+                    offset,
+                    limit
+                });
+            }
+
+            function setupIndexedPaneScroll(container, containerId, indexDbPath, sourceFilePath, displayPath) {
+                if (container.dataset.scrollBound === '1') return;
+                container.dataset.scrollBound = '1';
+                container.addEventListener('scroll', () => {
+                    const total = Number(container.dataset.total || '0');
+                    const offset = Number(container.dataset.offset || '0');
+                    const limit = Number(container.dataset.limit || '200');
+                    if (offset >= total) return;
+                    const nearBottom = container.scrollTop + container.clientHeight >= container.scrollHeight - 40;
+                    if (nearBottom) {
+                        requestIndexedPanePage(containerId, indexDbPath, sourceFilePath, displayPath, offset, limit);
+                    }
+                });
+            }
+
+            function toggleFullStructurePanel(containerId, toggleId, indexDbPath, sourceFilePath, displayPath, startOffset, endOffsetExclusive) {
+                const container = document.getElementById(containerId);
+                const toggle = document.getElementById(toggleId);
+                if (!container || !toggle) return;
+
+                const arrow = toggle.querySelector('.arrow');
+                const isOpen = container.style.display === 'block';
+
+                if (isOpen) {
+                    container.style.display = 'none';
+                    if (arrow) arrow.textContent = '▸';
+                    return;
+                }
+
+                container.style.display = 'block';
+                if (arrow) arrow.textContent = '▾';
+
+                if (container.dataset.inited === '1') return;
+
+                container.dataset.inited = '1';
+                container.dataset.offset = '0';
+                container.dataset.limit = '200';
+                container.dataset.total = '0';
+                container.dataset.indexDbPath = indexDbPath;
+                container.dataset.sourceFilePath = sourceFilePath;
+                container.dataset.displayPath = displayPath;
+                const start = Number(startOffset || 0);
+                const endRaw = endOffsetExclusive === undefined || endOffsetExclusive === null || endOffsetExclusive === '' ? '' : String(endOffsetExclusive);
+                container.dataset.startOffset = String(Number.isFinite(start) && start > 0 ? start : 0);
+                container.dataset.endOffset = endRaw;
+                container.innerHTML = '<div class="hint">${t('full_json_preview_loading')}</div>';
+                const firstOffset = Number(container.dataset.startOffset || '0');
+                requestIndexedPanePage(containerId, indexDbPath, sourceFilePath, displayPath, firstOffset, 200);
+                setupIndexedPaneScroll(container, containerId, indexDbPath, sourceFilePath, displayPath);
+            }
+
+            function toggleIndexedNode(containerId, toggleId, encodedDisplayPath) {
+                const container = document.getElementById(containerId);
+                const toggle = document.getElementById(toggleId);
+                if (!container || !toggle) return;
+                const parentPane = container.closest('.full-structure-pane');
+                if (!parentPane) return;
+
+                const indexDbPath = parentPane.dataset.indexDbPath || '';
+                const sourceFilePath = parentPane.dataset.sourceFilePath || '';
+                const displayPath = decodeURIComponent(encodedDisplayPath || '');
+                const arrow = toggle.querySelector('.arrow');
+                const isOpen = container.style.display === 'block';
+
+                if (isOpen) {
+                    container.style.display = 'none';
+                    if (arrow) arrow.textContent = '▸';
+                    return;
+                }
+
+                container.style.display = 'block';
+                if (arrow) arrow.textContent = '▾';
+
+                if (container.dataset.inited === '1') return;
+
+                container.dataset.inited = '1';
+                container.dataset.offset = '0';
+                container.dataset.limit = '200';
+                container.dataset.total = '0';
+                container.dataset.indexDbPath = indexDbPath;
+                container.dataset.sourceFilePath = sourceFilePath;
+                container.dataset.displayPath = displayPath;
+                container.dataset.startOffset = '0';
+                container.dataset.endOffset = '';
+                container.innerHTML = '<div class="hint">${t('indexed_node_loading')}</div>';
+                requestIndexedPanePage(containerId, indexDbPath, sourceFilePath, displayPath, 0, 200);
+                setupIndexedPaneScroll(container, containerId, indexDbPath, sourceFilePath, displayPath);
+            }
+
             // 监听插件发回来的数据
             window.addEventListener('message', event => {
                 const message = event.data;
@@ -760,20 +1660,66 @@ export function getWebviewContent(bodyContent: string, webview?: vscode.Webview)
                         container.innerHTML = '<span style="color:red">Error: ' + message.data.error + '</span>';
                     } else {
                         const stats = message.data.stats;
-                        const preview = message.data.preview;
+                        const preview = String(message.data.preview ?? '').trimStart();
                         
                         // 渲染统计信息
-                        const statsHtml = \`
-                            <div class="stats-row">
-                                <span class="stats-item">Min: <strong>\${stats.min}</strong></span>
-                                <span class="stats-item">Max: <strong>\${stats.max}</strong></span>
-                                <span class="stats-item">Mean: <strong>\${stats.mean}</strong></span>
-                                <span class="stats-item">Std: <strong>\${stats.std}</strong></span>
-                            </div>
-                        \`;
+                        const statsHtml = '<div class="stats-row">'
+                            + '<span class="stats-item">Min: <strong>' + stats.min + '</strong></span>'
+                            + '<span class="stats-item">Max: <strong>' + stats.max + '</strong></span>'
+                            + '<span class="stats-item">Mean: <strong>' + stats.mean + '</strong></span>'
+                            + '<span class="stats-item">Std: <strong>' + stats.std + '</strong></span>'
+                            + '</div>';
                         
                         // 渲染多维数组内容
-                        container.innerHTML = statsHtml + preview;
+                        container.innerHTML = statsHtml + '<pre class="tensor-preview-text">' + preview + '</pre>';
+                    }
+                }
+
+                if (message.command === 'indexedTruncatedPaneData') {
+                    const payload = message.payload || {};
+                    const container = document.getElementById(payload.containerId);
+                    if (!container) return;
+
+                    container.dataset.loading = '0';
+                    const result = payload.result || {};
+                    if (result.error) {
+                        container.innerHTML = '<div style="color:var(--vscode-errorForeground)">' + result.error + '</div>';
+                        return;
+                    }
+                    const children = result.children || [];
+                    const total = Number(result.total_children || 0);
+                    const currentOffset = Number(payload.offset || 0);
+                    const limit = Number(payload.limit || 200);
+                    const startOffset = Number(container.dataset.startOffset || '0');
+                    const endOffsetRaw = container.dataset.endOffset || '';
+                    const endOffsetExclusive = endOffsetRaw !== '' ? Number(endOffsetRaw) : null;
+                    const append = currentOffset > startOffset;
+                    container.querySelectorAll('.load-more-hint').forEach(el => el.remove());
+                    if (result.current && result.current.node_type) {
+                        container.dataset.parentNodeType = String(result.current.node_type);
+                    }
+                    const parentNodeType = container.dataset.parentNodeType || 'object';
+                    renderIndexedChildren(container, children, append, parentNodeType);
+                    const indexDbPath = container.dataset.indexDbPath || '';
+                    const sourceFilePath = container.dataset.sourceFilePath || '';
+                    const displayPath = container.dataset.displayPath || '';
+                    setupIndexedPaneScroll(container, payload.containerId, indexDbPath, sourceFilePath, displayPath);
+                    const effectiveTotal = endOffsetExclusive !== null ? Math.min(total, endOffsetExclusive) : total;
+                    const nextOffset = currentOffset + children.length;
+                    container.dataset.total = String(effectiveTotal);
+                    container.dataset.offset = String(nextOffset);
+                    container.dataset.limit = String(limit);
+                    if (nextOffset < effectiveTotal) {
+                        container.innerHTML += '<div class="load-more-hint" style="padding:6px 0; color:var(--vscode-descriptionForeground);">...滚动加载更多...</div>';
+                    }
+                }
+
+                if (message.command === 'copyKeyResult') {
+                    const requestId = message.requestId || '';
+                    const btn = pendingCopyButtons[requestId];
+                    if (btn) {
+                        setCopyButtonFeedback(btn, !!message.success);
+                        delete pendingCopyButtons[requestId];
                     }
                 }
             });
@@ -787,7 +1733,7 @@ export function getWebviewContent(bodyContent: string, webview?: vscode.Webview)
 }
 
 // 1. 修改参数类型：keyPath 改为 string[]，默认是空数组
-export function generateJsonHtml(data: any, keyPath: string[] = []): string {
+export function generateJsonHtml(data: any, keyPath: string[] = [], fullStructurePath: string = '', fullStructureIndexPath: string = '', sourceFilePath: string = '', currentDisplayPath: string = '$'): string {
     // 原来是: if (!data) return '';  <-- 这是错的，因为 0 会被当成 false
     if (data === null || data === undefined) return '';
 
@@ -834,20 +1780,91 @@ export function generateJsonHtml(data: any, keyPath: string[] = []): string {
 
     let childrenHtml = '';
     let hasChildren = false;
+    let truncatedTotalCount: number | null = null;
+    const parseTruncatedTotal = (text: string): number | null => {
+        if (!text) return null;
+        const m = text.match(/total\s+([0-9,]+)/i);
+        if (!m) return null;
+        const raw = (m[1] || '').replace(/,/g, '');
+        const n = Number(raw);
+        return Number.isFinite(n) ? n : null;
+    };
+    const inlineKeyIntoDetailsSummary = (valueHtml: string, keyLabel: string): string => {
+        const isDetails = /^\s*<details[\s>]/.test(valueHtml);
+        if (!isDetails) return valueHtml;
+        const encodedKey = encodeURIComponent(keyLabel);
+        return valueHtml.replace(
+            '<summary>',
+            `<summary><span class="node-key-chip">${keyLabel}</span><button class="copy-key-btn" data-key-text="${encodedKey}" title="Copy key" onclick="event.preventDefault(); event.stopPropagation(); copyKeyName(this)">copy</button><span class="node-sep">·</span>`
+        );
+    };
 
     if (Array.isArray(data)) {
         let listItems = '';
+        const truncationMarkerIndex = data.findIndex(
+            (item) => typeof item === 'string' && item.startsWith('__pth__truncated__') && item.endsWith('__pth__truncated__')
+        );
+        const truncationTotalFromMarker = truncationMarkerIndex >= 0
+            ? parseTruncatedTotal(String(data[truncationMarkerIndex] || ''))
+            : null;
+        const trailingVisibleCount = truncationMarkerIndex >= 0
+            ? (data.length - truncationMarkerIndex - 1)
+            : 0;
+        const mapToActualIndex = (renderIndex: number): number => {
+            if (
+                truncationMarkerIndex >= 0 &&
+                truncationTotalFromMarker !== null &&
+                renderIndex > truncationMarkerIndex
+            ) {
+                const trailingStart = truncationTotalFromMarker - trailingVisibleCount;
+                return trailingStart + (renderIndex - truncationMarkerIndex - 1);
+            }
+            return renderIndex;
+        };
         data.forEach((item, index) => {
+            const actualIndex = mapToActualIndex(index);
             // === 核心修改：路径追加 (Push) ===
             // 创建新数组，避免污染父级 path
-            const currentPath = [...keyPath, index.toString()]; 
-            const value = generateJsonHtml(item, currentPath)
+            const currentPath = [...keyPath, actualIndex.toString()]; 
+            const childDisplayPath = currentDisplayPath === '$' ? `[${actualIndex}]` : `${currentDisplayPath}[${actualIndex}]`;
+            const value = generateJsonHtml(item, currentPath, fullStructurePath, fullStructureIndexPath, sourceFilePath, childDisplayPath)
             
             // 如果 item是string 并且 以__pth__truncated__ 开头以及结尾
             if (typeof item === 'string' && item.startsWith('__pth__truncated__') && item.endsWith('__pth__truncated__')) {
-                listItems += `<li class="truncated-item"><span>[${index}]: </span>${value}</li>`;
+                const parsedTotal = parseTruncatedTotal(item);
+                if (parsedTotal !== null) {
+                    truncatedTotalCount = parsedTotal;
+                }
+                const truncatedStartOffset = actualIndex;
+                const truncatedEndOffsetExclusive = parsedTotal !== null
+                    ? Math.max(truncatedStartOffset, parsedTotal - trailingVisibleCount)
+                    : '';
+                if (fullStructureIndexPath) {
+                    const safePath = encodeURIComponent(JSON.stringify(currentPath));
+                    const containerId = `full-structure-${safePath.replace(/[^a-zA-Z0-9]/g, '-')}`;
+                    const toggleId = `full-structure-toggle-${safePath.replace(/[^a-zA-Z0-9]/g, '-')}`;
+                    listItems += `
+                        <li class="truncated-item">
+                            <div class="truncated-toggle" id="${toggleId}" onclick="toggleFullStructurePanel('${containerId}', '${toggleId}', '${encodeURIComponent(fullStructureIndexPath)}', '${encodeURIComponent(sourceFilePath)}', '${encodeURIComponent(currentDisplayPath)}', '${truncatedStartOffset}', '${truncatedEndOffsetExclusive}')">
+                                <span class="arrow">▸</span>
+                                <span>[${actualIndex}]: ${value}</span>
+                            </div>
+                            <div class="full-structure-pane" id="${containerId}">
+                                <div class="hint">${t('full_json_hint_generated')}</div>
+                                <button onclick="vscode.postMessage({command: 'openFullStructureFolder', fullPath: '${encodeURIComponent(fullStructurePath)}'})">${t('open_full_json_folder')}</button>
+                            </div>
+                        </li>
+                    `;
+                } else {
+                    listItems += `<li class="truncated-item"><span>[${actualIndex}]: </span>${value}</li>`;
+                }
             } else {
-                listItems += `<li><span class="key-name">[${index}]: </span>${value}</li>`;
+                const keyLabel = `[${actualIndex}]`;
+                if (/^\s*<details[\s>]/.test(value)) {
+                    listItems += `<li class="has-details">${inlineKeyIntoDetailsSummary(value, keyLabel)}</li>`;
+                } else {
+                    listItems += `<li><div class="node-inline"><span class="node-key-chip">${keyLabel}</span><span class="node-value">${value}</span></div></li>`;
+                }
             }
             
         });
@@ -857,17 +1874,64 @@ export function generateJsonHtml(data: any, keyPath: string[] = []): string {
         hasChildren = false;
     } else if (typeof data === 'object' && data !== null) {
         let listItems = '';
-        for (const key in data) {
-            if (['_type', 'dtype', 'shape', 'location'].includes(key)) continue;
+        const objectKeys = Object.keys(data).filter(k => !['_type', 'dtype', 'shape', 'location'].includes(k));
+        const dictMarkerIndex = objectKeys.findIndex(
+            k => k.startsWith('__pth__truncated__') && k.endsWith('__pth__truncated__')
+        );
+        const dictTotalFromMarker = dictMarkerIndex >= 0
+            ? parseTruncatedTotal(typeof data[objectKeys[dictMarkerIndex]] === 'string' ? data[objectKeys[dictMarkerIndex]] : objectKeys[dictMarkerIndex])
+            : null;
+        const dictTrailingVisibleCount = dictMarkerIndex >= 0 ? (objectKeys.length - dictMarkerIndex - 1) : 0;
+
+        for (const key of objectKeys) {
             // === 核心修改：路径追加 (Push) ===
             const currentPath = [...keyPath, key];
-            const value = generateJsonHtml(data[key], currentPath)
+            const childDisplayPath = currentDisplayPath === '$' ? key : `${currentDisplayPath}.${key}`;
+            const value = generateJsonHtml(data[key], currentPath, fullStructurePath, fullStructureIndexPath, sourceFilePath, childDisplayPath)
 
             // 对 __pth__truncated__ 开头以及结尾的 key
             if (key.startsWith('__pth__truncated__') && key.endsWith('__pth__truncated__')) {
-                listItems += `<li class="truncated-item"><span">"${key}": </span>${value}</li>`;
+                if (typeof data[key] === 'string') {
+                    const parsedTotal = parseTruncatedTotal(data[key]);
+                    if (parsedTotal !== null) {
+                        truncatedTotalCount = parsedTotal;
+                    }
+                } else {
+                    const parsedTotal = parseTruncatedTotal(key);
+                    if (parsedTotal !== null) {
+                        truncatedTotalCount = parsedTotal;
+                    }
+                }
+                if (fullStructureIndexPath) {
+                    const safePath = encodeURIComponent(JSON.stringify(currentPath));
+                    const containerId = `full-structure-${safePath.replace(/[^a-zA-Z0-9]/g, '-')}`;
+                    const toggleId = `full-structure-toggle-${safePath.replace(/[^a-zA-Z0-9]/g, '-')}`;
+                    const dictTruncatedStartOffset = dictMarkerIndex >= 0 ? dictMarkerIndex : 0;
+                    const dictTruncatedEndOffsetExclusive = dictTotalFromMarker !== null
+                        ? Math.max(dictTruncatedStartOffset, dictTotalFromMarker - dictTrailingVisibleCount)
+                        : '';
+                    listItems += `
+                        <li class="truncated-item">
+                            <div class="truncated-toggle" id="${toggleId}" onclick="toggleFullStructurePanel('${containerId}', '${toggleId}', '${encodeURIComponent(fullStructureIndexPath)}', '${encodeURIComponent(sourceFilePath)}', '${encodeURIComponent(currentDisplayPath)}', '${dictTruncatedStartOffset}', '${dictTruncatedEndOffsetExclusive}')">
+                                <span class="arrow">▸</span>
+                                <span>"${key}": ${value}</span>
+                            </div>
+                            <div class="full-structure-pane" id="${containerId}">
+                                <div class="hint">${t('full_json_hint_generated')}</div>
+                                <button onclick="vscode.postMessage({command: 'openFullStructureFolder', fullPath: '${encodeURIComponent(fullStructurePath)}'})">${t('open_full_json_folder')}</button>
+                            </div>
+                        </li>
+                    `;
+                } else {
+                    listItems += `<li class="truncated-item"><span">"${key}": </span>${value}</li>`;
+                }
             } else {
-                listItems += `<li><span class="key-name">"${key}": </span>${value}</li>`;
+                const keyLabel = `"${key}"`;
+                if (/^\s*<details[\s>]/.test(value)) {
+                    listItems += `<li class="has-details">${inlineKeyIntoDetailsSummary(value, keyLabel)}</li>`;
+                } else {
+                    listItems += `<li><div class="node-inline"><span class="node-key-chip">${keyLabel}</span><span class="node-value">${value}</span></div></li>`;
+                }
             }
 
             
@@ -881,7 +1945,9 @@ export function generateJsonHtml(data: any, keyPath: string[] = []): string {
     } else if (isTensor) {
         return tensorHtml;
     } else if (hasChildren) {
-        const summary = Array.isArray(data) ? 'List []' : 'Dict {}';
+        const summary = Array.isArray(data)
+            ? `List [${truncatedTotalCount ?? data.length}]`
+            : `Dict {${truncatedTotalCount ?? Object.keys(data).length}}`;
         return `<details open><summary>${summary}</summary>${childrenHtml}</details>`;
     } else {
         // === 修复开始：针对空对象/空数组的显示优化 ===
@@ -891,9 +1957,9 @@ export function generateJsonHtml(data: any, keyPath: string[] = []): string {
             const emptyStyle = 'color:var(--vscode-descriptionForeground); font-style:italic;';
             
             if (Array.isArray(data)) {
-                 return `<span style="${emptyStyle}">List [] (Empty)</span>`;
+                 return `<span style="${emptyStyle}">List [0] (Empty)</span>`;
             } else {
-                 return `<span style="${emptyStyle}">Dict {} (Empty)</span>`;
+                 return `<span style="${emptyStyle}">Dict {0} (Empty)</span>`;
             }
         }
         // === 修复结束 ===

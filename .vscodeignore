@@ -1,6 +1,8 @@
 .vscode/**
 .vscode-test/**
 src/**
+.git/**
+node_modules/**
 .gitignore
 .yarnrc
 vsc-extension-quickstart.md
@@ -9,3 +11,7 @@ vsc-extension-quickstart.md
 **/*.map
 **/*.ts
 **/.vscode-test.*
+python_scripts/__pycache__/**
+**/__pycache__/**
+*.vsix
+修改思路.md
