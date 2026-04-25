@@ -17,7 +17,7 @@ export async function activate(context: vscode.ExtensionContext) {
             {
                 webviewOptions: {
                     retainContextWhenHidden: true,
-                    enableFindWidget: true,
+                    enableFindWidget: false,
                 } // 隐藏后保留状态，提升性能 + 使用原生查找面板
             }
         )

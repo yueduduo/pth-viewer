@@ -177,9 +177,29 @@ const messages = {
         zh: "JSON",
         en: "JSON"
     },
+    json_path_copied: {
+        zh: "已复制完整结构 JSON 路径",
+        en: "Copied full-structure JSON path"
+    },
+    json_path_copy_failed: {
+        zh: "复制路径失败",
+        en: "Failed to copy path"
+    },
     btn_find: {
         zh: "查找",
         en: "Find"
+    },
+    find_no_results: {
+        zh: "无结果",
+        en: "No results"
+    },
+    find_match_case: {
+        zh: "区分大小写",
+        en: "Match Case"
+    },
+    find_whole_word: {
+        zh: "全词匹配",
+        en: "Whole Word"
     },
     full_json_preview_load: {
         zh: "加载完整结构",

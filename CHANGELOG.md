@@ -76,3 +76,7 @@ Added
 * ui: 美化树形结构和inspect，增加对截断数据的可视化
 * ui: 增加find, collapse，json按钮
 * server: 修复多文件并发争夺，增加sqlite对截断数据的保存
+
+## [0.0.12] - 2026-04-25
+
+* ui: coping json path for ssh server & customed find button

@@ -143,11 +143,7 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
             }
 
             if (message.command === 'openFind') {
-                try {
-                    await vscode.commands.executeCommand('editor.action.webvieweditor.showFind');
-                } catch {
-                    await vscode.commands.executeCommand('actions.find');
-                }
+                webviewPanel.webview.postMessage({ command: 'showCustomFind' });
             }
 
             if (message.command === 'copyKey') {
@@ -726,6 +722,13 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
             vscode.window.showWarningMessage(t('full_json_not_generated'));
             return;
         }
+        try {
+            await vscode.env.clipboard.writeText(fullPath);
+            vscode.window.showInformationMessage(t('json_path_copied'));
+        } catch (err) {
+            const detail = err instanceof Error ? err.message : String(err);
+            vscode.window.showWarningMessage(`${t('json_path_copy_failed')}: ${detail}`);
+        }
         await vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(fullPath));
     }
 }
@@ -736,6 +739,24 @@ export class PthEditorProvider implements vscode.CustomReadonlyEditorProvider<Pt
 // ----------------------------------------------------
 //  辅助函数 (保持不变)
 // ----------------------------------------------------
+
+function escapeHtmlAttr(value: string): string {
+    return value
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/</g, '&lt;')
+        .replace(/\r?\n/g, ' ');
+}
+
+/** 顶栏与截断面板中的「JSON」按钮：悬浮显示路径，点击复制路径并在系统中显示文件 */
+function fullJsonRevealButtonHtml(fullStructurePath: string): string {
+    const pathRaw = fullStructurePath || '';
+    const titleText = pathRaw.length > 0 ? pathRaw : t('full_json_not_generated');
+    const titleAttr = escapeHtmlAttr(titleText);
+    const encoded = encodeURIComponent(pathRaw);
+    const label = t('open_full_json_folder');
+    return `<button type="button" title="${titleAttr}" onclick="vscode.postMessage({command: 'openFullStructureFolder', fullPath: '${encoded}'})">${label}</button>`;
+}
 
 function generatePageHtml(result: any, isForceLocal: boolean, fileSizeStr: string, fallbackSourceFilePath: string = ''): string {
     const isGlobal = result.is_global;
@@ -766,7 +787,7 @@ function generatePageHtml(result: any, isForceLocal: boolean, fileSizeStr: strin
     //    <div class="status-right"> [刷新按钮] [切换模式按钮] </div>
     // </div>
 
-    const openFullJsonFolderButton = `<button onclick="vscode.postMessage({command: 'openFullStructureFolder', fullPath: '${encodeURIComponent(fullStructurePath || "")}'})">${t('open_full_json_folder')}</button>`;
+    const openFullJsonFolderButton = fullJsonRevealButtonHtml(fullStructurePath);
 
     let controlBar = `
         <div class="status-bar ${statusClass}">
@@ -1191,33 +1212,124 @@ export function getWebviewContent(bodyContent: string, webview?: vscode.Webview)
                 padding-left: 18px;
             }
             .webview-find {
-                position: sticky;
-                top: 6px;
+                position: fixed;
+                top: 10px;
+                right: 12px;
                 z-index: 9999;
-                float: right;
                 display: none;
                 align-items: center;
-                gap: 6px;
-                padding: 6px;
-                border: 1px solid var(--vscode-widget-border);
-                border-radius: 6px;
+                gap: 8px;
+                padding: 4px 8px;
+                border: 1px solid var(--vscode-editorWidget-border, var(--vscode-widget-border));
+                border-radius: 4px;
                 background: var(--vscode-editorWidget-background);
+                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+            }
+            .webview-find-input-wrap {
+                display: inline-flex;
+                align-items: center;
+                min-width: 240px;
+                max-width: 280px;
+                border: 1px solid var(--vscode-focusBorder, #0078d4);
+                border-radius: 4px;
+                background: var(--vscode-input-background);
+                overflow: hidden;
             }
             .webview-find input {
-                min-width: 220px;
-                padding: 4px 6px;
-                border: 1px solid var(--vscode-input-border);
-                background: var(--vscode-input-background);
+                min-width: 0;
+                width: 100%;
+                padding: 3px 6px;
+                border: none;
+                outline: none;
+                background: transparent;
                 color: var(--vscode-input-foreground);
-                border-radius: 4px;
             }
-            .webview-find .mini-btn {
-                padding: 2px 6px;
-                border: 1px solid var(--vscode-widget-border);
+            .webview-find-inline-tools {
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                padding-right: 8px;
+                white-space: nowrap;
+            }
+            .webview-find .toggle-btn {
+                border: none;
+                background: transparent;
+                color: var(--vscode-descriptionForeground);
+                padding: 0;
+                border-radius: 0;
+                cursor: pointer;
+                font-size: 0.95em;
+                line-height: 1;
+            }
+            .webview-find .toggle-btn.active {
+                color: var(--vscode-foreground);
+            }
+            .webview-find .toggle-btn[aria-disabled="true"] {
+                color: var(--vscode-descriptionForeground);
+                opacity: 0.85;
+                cursor: default;
+            }
+            .webview-find .result-count {
+                color: var(--vscode-foreground);
+                min-width: 70px;
+                text-align: left;
+                font-size: 0.92em;
+            }
+            .toggle-word-label {
+                position: relative;
+                display: inline-block;
+                line-height: 1;
+                padding-bottom: 1px;
+            }
+            .toggle-word-label::after {
+                content: '';
+                position: absolute;
+                left: -1px;
+                right: -1px;
+                bottom: 0;
+                border-bottom: 1px solid currentColor;
+                border-left: 1px solid currentColor;
+                border-right: 1px solid currentColor;
+                height: 2px;
+                border-bottom-left-radius: 1px;
+                border-bottom-right-radius: 1px;
+                opacity: 0.95;
+            }
+            .webview-find .result-count.warning {
+                color: var(--vscode-editorWarning-foreground, #d18616);
+            }
+            .webview-find .nav-btn {
+                border: none;
                 background: transparent;
                 color: var(--vscode-foreground);
-                border-radius: 4px;
+                padding: 0 2px;
                 cursor: pointer;
+                font-size: 15px;
+                line-height: 1;
+            }
+            .webview-find .nav-btn:disabled {
+                color: var(--vscode-disabledForeground);
+                cursor: default;
+            }
+            .webview-find .close-btn {
+                border: none;
+                background: transparent;
+                color: var(--vscode-descriptionForeground);
+                padding: 0 2px;
+                cursor: pointer;
+                font-size: 14px;
+                line-height: 1;
+            }
+            mark.webview-find-hit {
+                background: var(--vscode-editor-findMatchBackground);
+                color: var(--vscode-editor-findMatchForeground);
+                border: 1px solid var(--vscode-editor-findMatchBorder, transparent);
+                border-radius: 2px;
+                padding: 0;
+            }
+            mark.webview-find-hit.active {
+                background: var(--vscode-editor-findMatchHighlightBackground);
+                border-color: var(--vscode-editor-findMatchBorder, var(--vscode-focusBorder));
             }
         </style>
         <script>
@@ -1381,58 +1493,313 @@ export function getWebviewContent(bodyContent: string, webview?: vscode.Webview)
             function setupWebviewFind() {
                 const box = document.getElementById('webview-find-box');
                 const input = document.getElementById('webview-find-input');
+                const count = document.getElementById('webview-find-count');
                 const prevBtn = document.getElementById('webview-find-prev');
                 const nextBtn = document.getElementById('webview-find-next');
                 const closeBtn = document.getElementById('webview-find-close');
-                if (!box || !input || !prevBtn || !nextBtn || !closeBtn) return;
+                const caseBtn = document.getElementById('webview-find-case');
+                const wholeBtn = document.getElementById('webview-find-word');
+                const root = document.getElementById('webview-content-root');
+                if (!box || !input || !count || !prevBtn || !nextBtn || !closeBtn || !caseBtn || !wholeBtn || !root) return;
+
+                const state = {
+                    markGroups: [],
+                    current: -1,
+                    history: [],
+                    historyCursor: -1,
+                    matchCase: false,
+                    wholeWord: false,
+                    hasSearched: false,
+                };
+
+                // 字面量搜索仍用 RegExp 实现；必须把 [ ] ^ $ 等全部转义，否则 [2000] 会变成“字符类”匹配单字
+                const escapeRegExp = (text) => {
+                    const s = String(text);
+                    const z = String.fromCharCode(92);
+                    return s
+                        .split(z).join(z + z)
+                        .split('[').join(z + '[')
+                        .split(']').join(z + ']')
+                        .split('^').join(z + '^')
+                        .split('$').join(z + '$')
+                        .split('.').join(z + '.')
+                        .split('|').join(z + '|')
+                        .split('?').join(z + '?')
+                        .split('*').join(z + '*')
+                        .split('+').join(z + '+')
+                        .split('(').join(z + '(')
+                        .split(')').join(z + ')')
+                        .split('{').join(z + '{')
+                        .split('}').join(z + '}');
+                };
+
+                const saveHistory = (term) => {
+                    const value = String(term || '').trim();
+                    if (!value) return;
+                    state.history = [value, ...state.history.filter(item => item !== value)].slice(0, 20);
+                    state.historyCursor = -1;
+                };
+
+                const clearHighlights = () => {
+                    root.querySelectorAll('mark.webview-find-hit').forEach(mark => {
+                        const parent = mark.parentNode;
+                        if (!parent) return;
+                        parent.replaceChild(document.createTextNode(mark.textContent || ''), mark);
+                        parent.normalize();
+                    });
+                    state.markGroups = [];
+                    state.current = -1;
+                };
+
+                const buildTextSegments = () => {
+                    const segments = [];
+                    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+                        acceptNode(node) {
+                            if (!node || node.nodeValue === null) return NodeFilter.FILTER_REJECT;
+                            const parent = node.parentElement;
+                            if (!parent) return NodeFilter.FILTER_REJECT;
+                            if (parent.closest('.webview-find')) return NodeFilter.FILTER_REJECT;
+                            if (parent.closest('script,style,mark')) return NodeFilter.FILTER_REJECT;
+                            return NodeFilter.FILTER_ACCEPT;
+                        }
+                    });
+                    let node;
+                    while ((node = walker.nextNode())) {
+                        segments.push({ node, text: String(node.nodeValue || '') });
+                    }
+                    return segments;
+                };
+
+                const collectGlobalMatchRanges = (term, segments) => {
+                    const needle = String(term || '');
+                    if (!needle.length) return [];
+                    let flat = '';
+                    segments.forEach(seg => { flat += seg.text; });
+                    const ranges = [];
+                    if (state.wholeWord) {
+                        const pattern = '\\\\b' + escapeRegExp(needle) + '\\\\b';
+                        const flags = state.matchCase ? 'g' : 'gi';
+                        const regex = new RegExp(pattern, flags);
+                        let m;
+                        while ((m = regex.exec(flat)) !== null) {
+                            ranges.push([m.index, m.index + m[0].length]);
+                            if (m[0].length === 0) regex.lastIndex += 1;
+                        }
+                        return ranges;
+                    }
+                    const hay = state.matchCase ? flat : flat.toLowerCase();
+                    const ndl = state.matchCase ? needle : needle.toLowerCase();
+                    let pos = 0;
+                    while (pos <= hay.length) {
+                        const idx = hay.indexOf(ndl, pos);
+                        if (idx < 0) break;
+                        ranges.push([idx, idx + needle.length]);
+                        pos = idx + needle.length;
+                    }
+                    return ranges;
+                };
+
+                const mapGlobalRangeToSegments = (segments, gs, ge) => {
+                    const ops = [];
+                    let offset = 0;
+                    for (let si = 0; si < segments.length; si++) {
+                        const len = segments[si].text.length;
+                        const segStart = offset;
+                        const segEnd = offset + len;
+                        offset = segEnd;
+                        if (ge <= segStart || gs >= segEnd) continue;
+                        ops.push({
+                            si,
+                            start: Math.max(0, gs - segStart),
+                            end: Math.min(len, ge - segStart),
+                        });
+                    }
+                    return ops;
+                };
+
+                const applyHighlightsFromGlobal = (segments, globalRanges) => {
+                    const occOps = [];
+                    globalRanges.forEach(([gs, ge], occId) => {
+                        mapGlobalRangeToSegments(segments, gs, ge).forEach(op => {
+                            occOps.push({ occId, si: op.si, start: op.start, end: op.end });
+                        });
+                    });
+                    occOps.sort((a, b) => (a.si === b.si ? b.start - a.start : b.si - a.si));
+                    const groups = globalRanges.map(() => []);
+                    occOps.forEach(op => {
+                        const seg = segments[op.si];
+                        if (!seg || !seg.node || !seg.node.parentNode) return;
+                        let live = seg.node;
+                        live.splitText(op.end);
+                        const middle = live.splitText(op.start);
+                        const mark = document.createElement('mark');
+                        mark.className = 'webview-find-hit';
+                        mark.setAttribute('data-find-occ', String(op.occId));
+                        mark.textContent = middle.nodeValue || '';
+                        middle.parentNode.replaceChild(mark, middle);
+                        seg.node = live;
+                        groups[op.occId].push(mark);
+                    });
+                    state.markGroups = groups.filter(g => g.length > 0);
+                };
+
+                const updateCounter = () => {
+                    if (state.markGroups.length === 0) {
+                        count.textContent = '${t('find_no_results')}';
+                        const searchActive = state.hasSearched && String(input.value || '').trim().length > 0;
+                        count.classList.toggle('warning', searchActive);
+                        prevBtn.disabled = true;
+                        nextBtn.disabled = true;
+                        return;
+                    }
+                    count.classList.remove('warning');
+                    prevBtn.disabled = false;
+                    nextBtn.disabled = false;
+                    count.textContent = String(state.current + 1) + '/' + String(state.markGroups.length);
+                };
+
+                const focusMatch = (index, scrollMode) => {
+                    if (state.markGroups.length === 0) {
+                        state.current = -1;
+                        updateCounter();
+                        return;
+                    }
+                    document.querySelectorAll('mark.webview-find-hit').forEach(m => m.classList.remove('active'));
+                    state.current = (index + state.markGroups.length) % state.markGroups.length;
+                    const group = state.markGroups[state.current] || [];
+                    group.forEach(m => m.classList.add('active'));
+                    const anchor = group[0];
+                    if (anchor) {
+                        anchor.scrollIntoView({ block: scrollMode || 'center', behavior: 'smooth' });
+                    }
+                    updateCounter();
+                };
+
+                const runSearch = (keepIndex) => {
+                    const term = String(input.value || '');
+                    const trimmed = term.trim();
+                    const prevIndex = state.current;
+                    state.hasSearched = trimmed.length > 0;
+                    clearHighlights();
+                    if (!trimmed) {
+                        updateCounter();
+                        return;
+                    }
+                    const segments = buildTextSegments();
+                    const globalRanges = collectGlobalMatchRanges(trimmed, segments);
+                    if (globalRanges.length === 0) {
+                        updateCounter();
+                        return;
+                    }
+                    applyHighlightsFromGlobal(segments, globalRanges);
+                    if (keepIndex && prevIndex >= 0 && prevIndex < state.markGroups.length) {
+                        focusMatch(prevIndex, 'nearest');
+                    } else {
+                        focusMatch(0, 'center');
+                    }
+                };
 
                 const openFind = () => {
                     box.style.display = 'inline-flex';
                     input.focus();
                     input.select();
                 };
+
                 const closeFind = () => {
                     box.style.display = 'none';
                 };
+
                 const runFind = (forward) => {
-                    const term = String(input.value || '');
+                    const term = String(input.value || '').trim();
                     if (!term) return;
-                    const found = window.find(term, false, !forward, true, false, false, false);
-                    if (!found) {
-                        window.find(term, false, !forward, true, false, false, true);
+                    saveHistory(term);
+                    if (state.markGroups.length === 0) {
+                        runSearch(false);
+                        return;
                     }
+                    focusMatch(state.current + (forward ? 1 : -1), 'center');
                 };
 
                 prevBtn.addEventListener('click', () => runFind(false));
                 nextBtn.addEventListener('click', () => runFind(true));
-                closeBtn.addEventListener('click', closeFind);
+
+                closeBtn.addEventListener('click', () => {
+                    clearHighlights();
+                    state.hasSearched = false;
+                    updateCounter();
+                    closeFind();
+                });
+
+                caseBtn.addEventListener('click', () => {
+                    state.matchCase = !state.matchCase;
+                    caseBtn.classList.toggle('active', state.matchCase);
+                    runSearch(false);
+                });
+
+                wholeBtn.addEventListener('click', () => {
+                    state.wholeWord = !state.wholeWord;
+                    wholeBtn.classList.toggle('active', state.wholeWord);
+                    runSearch(false);
+                });
+
+                input.addEventListener('input', () => runSearch(false));
+
                 input.addEventListener('keydown', (e) => {
                     if (e.key === 'Enter') {
                         e.preventDefault();
+                        saveHistory(input.value);
                         runFind(!e.shiftKey);
-                    } else if (e.key === 'Escape') {
+                        return;
+                    }
+                    if (e.key === 'Escape') {
                         e.preventDefault();
                         closeFind();
+                        return;
+                    }
+                    if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+                        if (state.history.length === 0) return;
+                        e.preventDefault();
+                        if (state.historyCursor === -1) {
+                            state.historyCursor = e.key === 'ArrowUp' ? 0 : state.history.length - 1;
+                        } else {
+                            const delta = e.key === 'ArrowUp' ? 1 : -1;
+                            state.historyCursor = (state.historyCursor + delta + state.history.length) % state.history.length;
+                        }
+                        input.value = state.history[state.historyCursor] || '';
+                        runSearch(false);
                     }
                 });
+
                 document.addEventListener('keydown', (e) => {
                     const isFind = (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f';
                     if (isFind) {
                         e.preventDefault();
+                        e.stopPropagation();
                         openFind();
                         return;
                     }
                     if (e.key === 'F3') {
                         e.preventDefault();
+                        e.stopPropagation();
                         runFind(!e.shiftKey);
                     }
+                }, true);
+
+                window.addEventListener('message', event => {
+                    const message = event.data || {};
+                    if (message.command === 'showCustomFind') {
+                        openFind();
+                    }
                 });
+
+                updateCounter();
             }
 
             window.addEventListener('DOMContentLoaded', () => {
                 captureInitialTreeState();
                 updateCollapseButtonState(false);
                 normalizePreviewLayout(document);
+                setupWebviewFind();
             });
 
             function displayPathToPathArray(displayPath) {
@@ -1531,7 +1898,7 @@ export function getWebviewContent(bodyContent: string, webview?: vscode.Webview)
                         '<div class="node-inline">'
                         + expandHtml
                         + keyPrefix
-                        + '<span class="node-value">' + valueHtml + '</span>'
+                        + ' <span class="node-value">' + valueHtml + '</span>'
                         + inspectHtml
                         + '</div>'
                         + '<div id="' + childContainerId + '" class="full-structure-pane indexed-children" style="display:none; margin-left:20px;"></div>';
@@ -1726,8 +2093,21 @@ export function getWebviewContent(bodyContent: string, webview?: vscode.Webview)
         </script>
     </head>
     <body>
+        <div id="webview-find-box" class="webview-find">
+            <div class="webview-find-input-wrap">
+                <input id="webview-find-input" autocomplete="off" placeholder="${t('btn_find')}" />
+                <div class="webview-find-inline-tools">
+                    <button id="webview-find-case" type="button" class="toggle-btn" title="${t('find_match_case')}">Aa</button>
+                    <button id="webview-find-word" type="button" class="toggle-btn" title="${t('find_whole_word')}"><span class="toggle-word-label">ab</span></button>
+                </div>
+            </div>
+            <span id="webview-find-count" class="result-count">${t('find_no_results')}</span>
+            <button id="webview-find-prev" type="button" class="nav-btn" aria-label="Previous match">↑</button>
+            <button id="webview-find-next" type="button" class="nav-btn" aria-label="Next match">↓</button>
+            <button id="webview-find-close" type="button" class="close-btn" aria-label="Close find">✕</button>
+        </div>
         <h2>PyTorch Structure Viewer</h2>
-        ${bodyContent}
+        <div id="webview-content-root">${bodyContent}</div>
     </body>
     </html>`;
 }
@@ -1851,7 +2231,7 @@ export function generateJsonHtml(data: any, keyPath: string[] = [], fullStructur
                             </div>
                             <div class="full-structure-pane" id="${containerId}">
                                 <div class="hint">${t('full_json_hint_generated')}</div>
-                                <button onclick="vscode.postMessage({command: 'openFullStructureFolder', fullPath: '${encodeURIComponent(fullStructurePath)}'})">${t('open_full_json_folder')}</button>
+                                ${fullJsonRevealButtonHtml(fullStructurePath)}
                             </div>
                         </li>
                     `;
@@ -1863,7 +2243,7 @@ export function generateJsonHtml(data: any, keyPath: string[] = [], fullStructur
                 if (/^\s*<details[\s>]/.test(value)) {
                     listItems += `<li class="has-details">${inlineKeyIntoDetailsSummary(value, keyLabel)}</li>`;
                 } else {
-                    listItems += `<li><div class="node-inline"><span class="node-key-chip">${keyLabel}</span><span class="node-value">${value}</span></div></li>`;
+                    listItems += `<li><div class="node-inline"><span class="node-key-chip">${keyLabel}</span> <span class="node-value">${value}</span></div></li>`;
                 }
             }
             
@@ -1918,7 +2298,7 @@ export function generateJsonHtml(data: any, keyPath: string[] = [], fullStructur
                             </div>
                             <div class="full-structure-pane" id="${containerId}">
                                 <div class="hint">${t('full_json_hint_generated')}</div>
-                                <button onclick="vscode.postMessage({command: 'openFullStructureFolder', fullPath: '${encodeURIComponent(fullStructurePath)}'})">${t('open_full_json_folder')}</button>
+                                ${fullJsonRevealButtonHtml(fullStructurePath)}
                             </div>
                         </li>
                     `;
@@ -1930,7 +2310,7 @@ export function generateJsonHtml(data: any, keyPath: string[] = [], fullStructur
                 if (/^\s*<details[\s>]/.test(value)) {
                     listItems += `<li class="has-details">${inlineKeyIntoDetailsSummary(value, keyLabel)}</li>`;
                 } else {
-                    listItems += `<li><div class="node-inline"><span class="node-key-chip">${keyLabel}</span><span class="node-value">${value}</span></div></li>`;
+                    listItems += `<li><div class="node-inline"><span class="node-key-chip">${keyLabel}</span> <span class="node-value">${value}</span></div></li>`;
                 }
             }
 
